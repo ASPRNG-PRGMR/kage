@@ -6,15 +6,16 @@
 //!
 //! ## Controls
 //!
-//! | Key | Action |
-//! |-----|--------|
-//! | `+` / `=` | Zoom in |
-//! | `-` | Zoom out |
+//! | Input | Action |
+//! |-------|--------|
+//! | Scroll wheel | Zoom in / out, anchored to cursor position |
+//! | `+` / `=` | Zoom in (keyboard) |
+//! | `-` | Zoom out (keyboard) |
 //! | Arrow keys | Pan |
 //! | `1` | Switch to Greyscale view |
 //! | `2` | Switch to Subpixel AA view |
 //! | `3` | Switch to OLED-Aware view |
-//! | `A` | Cycle through all three (side-by-side) |
+//! | `A` | Side-by-side comparison (default) |
 //! | `H` | Toggle per-channel heatmap overlay |
 //! | `Esc` | Quit |
 //!
@@ -24,16 +25,20 @@
 //! A 1-pixel separator line is drawn between columns.
 //! A label strip at the top identifies each column.
 
-use minifb::{Key, Window, WindowOptions};
+use minifb::{Key, MouseMode, Window, WindowOptions};
 
+use crate::profile::DisplayProfile;
+use crate::render::encode_grid;
 use crate::subpixel::SubpixelGrid;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Default window width in host pixels.
-const DEFAULT_WIN_W: usize = 960;
-/// Default window height in host pixels (label strip + glyph area).
-const DEFAULT_WIN_H: usize = 600;
+/// Fraction of screen width/height the window occupies on open.
+const SCREEN_FRACTION: f64 = 0.80;
+/// Fallback window width if screen resolution cannot be determined.
+const FALLBACK_WIN_W: usize = 1280;
+/// Fallback window height.
+const FALLBACK_WIN_H: usize = 800;
 /// Height of the label strip at the top of the window, in host pixels.
 const LABEL_H: usize = 20;
 /// Colour of the separator line between panels (dark grey).
@@ -42,10 +47,97 @@ const SEPARATOR_COLOR: u32 = 0xFF_33_33_33;
 const BG_COLOR: u32 = 0xFF_10_10_10;
 /// Label strip background.
 const LABEL_BG: u32 = 0xFF_1A_1A_2E;
-/// Label text colour (drawn as a solid block — no font rendering in the inspector itself).
 /// Label text colour — reserved for Phase 4 when real text rendering lands in the inspector.
 #[allow(dead_code)]
 const LABEL_FG: u32 = 0xFF_E0_E0_E0;
+
+// ── Screen resolution detection ───────────────────────────────────────────────
+
+/// Attempt to read the primary display resolution from the kernel DRM subsystem.
+///
+/// `/sys/class/drm/` is available on Linux regardless of whether the session
+/// is X11 or Wayland.  Each connected output exposes a `modes` file whose
+/// first line is the preferred/active mode in `WxH` format.
+///
+/// Falls back to `xrandr` output parsing (X11 / XWayland), then to the
+/// hardcoded fallback dimensions if neither source is readable.
+fn detect_screen_size() -> (usize, usize) {
+    // ── Strategy 1: /sys/class/drm (X11 + Wayland, no subprocess) ────────
+    if let Some(res) = read_drm_modes() {
+        return res;
+    }
+
+    // ── Strategy 2: xrandr (X11 / XWayland only) ─────────────────────────
+    if let Some(res) = read_xrandr() {
+        return res;
+    }
+
+    // ── Strategy 3: hardcoded fallback ────────────────────────────────────
+    (FALLBACK_WIN_W, FALLBACK_WIN_H)
+}
+
+/// Parse `/sys/class/drm/card*/card*-*/modes` for the first valid `WxH` entry.
+fn read_drm_modes() -> Option<(usize, usize)> {
+    use std::fs;
+
+    let drm = std::path::Path::new("/sys/class/drm");
+    if !drm.exists() {
+        return None;
+    }
+
+    let entries = fs::read_dir(drm).ok()?;
+
+    for entry in entries.flatten() {
+        let path = entry.path().join("modes");
+        if !path.exists() {
+            continue;
+        }
+        let content = fs::read_to_string(&path).ok()?;
+        let first_line = content.lines().next()?;
+        if let Some((w, h)) = parse_wxh(first_line) {
+            if w > 0 && h > 0 {
+                return Some((w, h));
+            }
+        }
+    }
+    None
+}
+
+/// Run `xrandr` and parse the first connected output's current mode.
+fn read_xrandr() -> Option<(usize, usize)> {
+    use std::process::Command;
+
+    let output = Command::new("xrandr").output().ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    // Look for lines like: "   1920x1080     60.00*+"
+    // The asterisk marks the current active mode.
+    for line in text.lines() {
+        if line.contains('*') {
+            let token = line.split_whitespace().next()?;
+            if let Some((w, h)) = parse_wxh(token) {
+                return Some((w, h));
+            }
+        }
+    }
+    None
+}
+
+/// Parse a `WxH` or `W×H` string into `(width, height)`.
+fn parse_wxh(s: &str) -> Option<(usize, usize)> {
+    // Accept both ASCII 'x' and Unicode '×' as separators.
+    let sep = if s.contains('x') { 'x' } else { '×' };
+    let mut parts = s.splitn(2, sep);
+    let w = parts.next()?.trim().parse::<usize>().ok()?;
+    let h = parts.next()?.trim()
+        // strip trailing characters like refresh rate suffixes ("1080p60")
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse::<usize>()
+        .ok()?;
+    Some((w, h))
+}
 
 // ── Inspector ─────────────────────────────────────────────────────────────────
 
@@ -81,27 +173,34 @@ pub struct Inspector {
 }
 
 impl Inspector {
-    /// Create a new inspector window.
+    /// Create a new inspector window sized to 80% of the primary display.
+    ///
+    /// Screen resolution is detected at runtime via `/sys/class/drm` (works on
+    /// both X11 and Wayland) with `xrandr` as a fallback, then a hardcoded
+    /// 1280×800 if neither is available.
     pub fn new(title: &str) -> Result<Self, minifb::Error> {
+        let (screen_w, screen_h) = detect_screen_size();
+        let win_w = ((screen_w as f64 * SCREEN_FRACTION) as usize).max(640);
+        let win_h = ((screen_h as f64 * SCREEN_FRACTION) as usize).max(400);
+
         let mut win = Window::new(
             title,
-            DEFAULT_WIN_W,
-            DEFAULT_WIN_H,
+            win_w,
+            win_h,
             WindowOptions {
                 resize: true,
                 ..Default::default()
             },
         )?;
-        // ~60 fps update limit
         win.set_target_fps(60);
 
-        let fb = vec![BG_COLOR; DEFAULT_WIN_W * DEFAULT_WIN_H];
+        let fb = vec![BG_COLOR; win_w * win_h];
 
         Ok(Self {
             window: win,
             fb,
-            win_w: DEFAULT_WIN_W,
-            win_h: DEFAULT_WIN_H,
+            win_w,
+            win_h,
             zoom: 8,
             pan_x: 0,
             pan_y: 0,
@@ -120,22 +219,30 @@ impl Inspector {
     /// Call this once per frame inside your event loop.
     ///
     /// # Parameters
-    /// - `grey`   — output of the greyscale renderer
-    /// - `sp`     — output of the subpixel AA renderer
-    /// - `oled`   — output of the OLED-aware renderer
+    /// - `grey`    — linear-light output of the greyscale renderer
+    /// - `sp`      — linear-light output of the subpixel AA renderer
+    /// - `oled`    — linear-light output of the OLED-aware renderer
+    /// - `profile` — display profile used to EOTF-encode before blitting
     pub fn update(
         &mut self,
         grey: &SubpixelGrid,
         sp: &SubpixelGrid,
         oled: &SubpixelGrid,
+        profile: &DisplayProfile,
     ) -> Result<(), minifb::Error> {
         // Refresh window size (supports resize)
         self.win_w = self.window.get_size().0;
         self.win_h = self.window.get_size().1;
         self.fb.resize(self.win_w * self.win_h, BG_COLOR);
 
+        // EOTF-encode each linear-light grid into the signal domain for display.
+        // Cloning here is cheap relative to the per-pixel blit below.
+        let grey_enc = encode_grid(grey.clone(), profile);
+        let sp_enc   = encode_grid(sp.clone(),   profile);
+        let oled_enc = encode_grid(oled.clone(), profile);
+
         self.handle_input();
-        self.draw(grey, sp, oled);
+        self.draw(&grey_enc, &sp_enc, &oled_enc);
 
         self.window
             .update_with_buffer(&self.fb, self.win_w, self.win_h)?;
@@ -145,7 +252,41 @@ impl Inspector {
     // ── Input ─────────────────────────────────────────────────────────────────
 
     fn handle_input(&mut self) {
-        // Zoom
+        // ── Scroll-wheel zoom, anchored to cursor position ─────────────────
+        //
+        // The anchor logic ensures the source pixel under the cursor stays
+        // fixed as zoom changes:
+        //
+        //   src_col = pan_x + mouse_x / old_zoom
+        //   After zoom:
+        //   pan_x   = src_col - mouse_x / new_zoom
+        //
+        if let Some((_, scroll_y)) = self.window.get_scroll_wheel() {
+            if scroll_y.abs() > 0.1 {
+                let old_zoom = self.zoom as f32;
+
+                // Mouse position in window coordinates (clamped inside window).
+                let (mx, my) = self.window
+                    .get_mouse_pos(MouseMode::Clamp)
+                    .unwrap_or((self.win_w as f32 / 2.0, self.win_h as f32 / 2.0));
+
+                // Source pixel under cursor before zoom change.
+                let src_col = self.pan_x as f32 + mx / old_zoom;
+                let src_row = self.pan_y as f32 + (my - LABEL_H as f32).max(0.0) / old_zoom;
+
+                // Apply zoom delta — scroll up (positive y) = zoom in.
+                let delta = if scroll_y > 0.0 { 1i32 } else { -1 };
+                self.zoom = (self.zoom as i32 + delta).clamp(1, 32) as u32;
+
+                let new_zoom = self.zoom as f32;
+
+                // Adjust pan so the same source pixel stays under the cursor.
+                self.pan_x = (src_col - mx / new_zoom).round() as i32;
+                self.pan_y = (src_row - (my - LABEL_H as f32).max(0.0) / new_zoom).round() as i32;
+            }
+        }
+
+        // ── Keyboard zoom (fallback / fine control) ────────────────────────
         if self.window.is_key_pressed(Key::Equal, minifb::KeyRepeat::Yes) {
             self.zoom = (self.zoom + 1).min(32);
         }
@@ -153,7 +294,7 @@ impl Inspector {
             self.zoom = (self.zoom.saturating_sub(1)).max(1);
         }
 
-        // Pan
+        // ── Pan (arrow keys) ───────────────────────────────────────────────
         let pan_step = 1i32;
         if self.window.is_key_pressed(Key::Left, minifb::KeyRepeat::Yes) {
             self.pan_x -= pan_step;

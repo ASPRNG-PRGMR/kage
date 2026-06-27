@@ -37,6 +37,7 @@ This project explores a third path: **display-aware perceptual text reconstructi
 | Phase | Status | Description |
 |-------|--------|-------------|
 | **Phase 1** | ✅ Complete | Rendering sandbox + zoomable inspector |
+| **Phase 1.5** | ✅ Complete | Pipeline refactor — renderers return linear light |
 | **Phase 2** | 🔲 Next | Optical blur simulation, subpixel bleed, gamma reconstruction |
 | **Phase 3** | 🔲 Planned | Experimental rendering: luma/chroma decoupling, frequency-aware |
 | **Phase 4** | 🔲 Planned | GPU acceleration (OpenGL → Vulkan) |
@@ -51,15 +52,9 @@ This project explores a third path: **display-aware perceptual text reconstructi
 # Rust toolchain (stable)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# FreeType system library (required by the freetype crate)
-# Ubuntu / Debian:
-sudo apt install libfreetype6-dev
-
-# Arch:
-sudo pacman -S freetype2
-
-# macOS:
-brew install freetype
+# No system FreeType library needed — the "bundled" feature compiles
+# FreeType from source. A C compiler is required (installed by default
+# on most Linux distros and macOS with Xcode Command Line Tools).
 ```
 
 ### Build
@@ -90,10 +85,11 @@ cargo run --release -- \
 
 ### Inspector controls
 
-| Key | Action |
-|-----|--------|
-| `+` / `=` | Zoom in |
-| `-` | Zoom out |
+| Input | Action |
+|-------|--------|
+| Scroll wheel | Zoom in / out, anchored to cursor position |
+| `+` / `=` | Zoom in (keyboard) |
+| `-` | Zoom out (keyboard) |
 | Arrow keys | Pan |
 | `1` | Greyscale AA only |
 | `2` | Subpixel AA (ClearType-style) only |
@@ -114,13 +110,13 @@ font::loader::FontFace
       ▼
 glyph::GlyphBuffer          [R, G, B, A: f32]  linear light, width×height×4
       │
-      ├──▶ render::grayscale    → SubpixelGrid  (all channels = coverage)
-      ├──▶ render::subpixel_aa  → SubpixelGrid  (layout FIR, no fringe suppression)
-      └──▶ render::oled_aware   → SubpixelGrid  (layout FIR + adaptive fringe suppress)
-                                       │
-                               EOTF encode (profile::DisplayProfile)
-                                       │
-                               viz::Inspector   (minifb window, zoom/pan/heatmap)
+      ├──▶ render::grayscale    ──┐
+      ├──▶ render::subpixel_aa  ──┤──▶ SubpixelGrid (linear light)
+      └──▶ render::oled_aware   ──┘         │
+                                      render::encode_grid()   ← EOTF applied once
+                                             │
+                                    viz::Inspector   (minifb window, zoom/pan/heatmap)
+                                    simulate::*      (Phase 2 — operates in linear light)
 ```
 
 ### Key data types
@@ -162,11 +158,11 @@ Virtual subpixel grid. `from_glyph(buf, layout, fringe_suppress)` applies the la
 
 | Module | Strategy | Fringe suppression |
 |--------|----------|--------------------|
-| `grayscale.rs` | All channels = coverage, EOTF encoded | N/A |
-| `subpixel_aa.rs` | Layout FIR applied, no suppression | No |
-| `oled_aware.rs` | Layout FIR + adaptive blend at edges | Yes |
+| `grayscale.rs` | All channels = coverage, linear light | N/A |
+| `subpixel_aa.rs` | Layout FIR applied, linear light | No |
+| `oled_aware.rs` | Layout FIR + adaptive blend, linear light | Yes |
 
-All three auto-fall-back to greyscale on HiDPI or WRGB layouts.
+All three return **linear-light** grids. All three auto-fall-back to greyscale on HiDPI or WRGB layouts. `encode_grid()` in `render/mod.rs` is the single point where EOTF encoding happens, called by the inspector (and in future by the simulate module) immediately before display.
 
 ### `src/viz/inspector.rs` — `Inspector`
 minifb window with zoom (1–32×), pan, three single-panel views, side-by-side mode, and a false-colour heatmap overlay for channel imbalance analysis. At zoom ≥ 8× a pixel grid is drawn over the zoomed output. The label strip uses colour-coded accent bars (blue = greyscale, orange = subpixel AA, green = OLED-aware).
@@ -185,6 +181,12 @@ minifb window with zoom (1–32×), pan, three single-panel views, side-by-side 
 - [x] Adaptive fringe suppression (chromatic penalty + adaptive blend)
 - [x] SubpixelGrid with layout-aware filtering
 - [x] Zoomable inspector: zoom, pan, single/side-by-side, heatmap
+
+### Phase 1.5 — Pipeline Refactor ✅
+- [x] Renderers return linear-light `SubpixelGrid` (no EOTF inside renderers)
+- [x] `encode_grid()` moved to `render/mod.rs` — single encoding point
+- [x] Inspector calls `encode_grid()` per frame before blitting
+- [x] Phase 2 simulate module can now receive linear grids directly
 
 ### Phase 2 — Display Simulation 🔲
 - [ ] Optical PSF (point spread function) convolution
@@ -242,12 +244,16 @@ kage/
 │   │   └── pentile.rs             # Pentile RGBG FIR kernels, chromatic_penalty()
 │   ├── subpixel/
 │   │   ├── mod.rs                 # Re-exports SubpixelGrid, SubpixelPixel
-│   │   └── grid.rs                # Layout-aware filtering → SubpixelGrid
+│   │   └── grid.rs                # Layout-aware filtering → SubpixelGrid (linear light)
 │   ├── render/
-│   │   ├── mod.rs                 # RenderMode enum, render() dispatch fn
-│   │   ├── grayscale.rs           # Greyscale AA renderer
-│   │   ├── subpixel_aa.rs         # ClearType-style subpixel renderer + encode_grid()
-│   │   └── oled_aware.rs          # OLED-aware renderer with fringe suppression
+│   │   ├── mod.rs                 # RenderMode enum, render() dispatch, encode_grid()
+│   │   ├── grayscale.rs           # Greyscale AA renderer (returns linear light)
+│   │   ├── subpixel_aa.rs         # ClearType-style subpixel renderer (returns linear light)
+│   │   └── oled_aware.rs          # OLED-aware renderer (returns linear light)
+│   ├── simulate/                  # Phase 2 — optical blur, gamma reconstruction
+│   │   ├── mod.rs
+│   │   ├── optical_blur.rs
+│   │   └── gamma.rs
 │   └── viz/
 │       ├── mod.rs                 # Re-exports Inspector
 │       └── inspector.rs           # minifb window: zoom, pan, heatmap, side-by-side

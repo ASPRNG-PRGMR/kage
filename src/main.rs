@@ -148,7 +148,7 @@ fn main() {
 
     // Main event loop
     while inspector.is_open() {
-        if let Err(e) = inspector.update(&grey_grid, &sp_grid, &oled_grid) {
+        if let Err(e) = inspector.update(&grey_grid, &sp_grid, &oled_grid, &profile) {
             eprintln!("Inspector error: {e}");
             break;
         }
