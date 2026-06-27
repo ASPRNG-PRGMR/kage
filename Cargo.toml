@@ -1,6 +1,33 @@
 [package]
 name = "kage"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+[[bin]]
+name = "kage"
+path = "src/main.rs"
+
+[lib]
+name = "kage"
+path = "src/lib.rs"
 
 [dependencies]
+# Font loading and rasterization.
+# package = "freetype-rs" selects the PistonDevelopers safe wrapper whose lib
+# name is "freetype" (not the raw FFI crate also named "freetype" on crates.io).
+# The "bundled" feature compiles FreeType from vendored C source — no system
+# libfreetype2-dev / pkg-config required.
+freetype = { package = "freetype-rs", version = "0.38", features = ["bundled"] }
+
+# Lightweight software framebuffer window (no GPU required for Phase 1).
+minifb = "0.28"
+
+# CLI argument parsing.
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+
+[profile.dev]
+opt-level = 1

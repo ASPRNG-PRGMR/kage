@@ -21,17 +21,34 @@
 //!    greyscale fallback at high-contrast edges, where chromatic penalty exceeds gain
 //! 3. **Display profile integration** — EOTF-correct encoding and DPI-adaptive decisions
 //!
-//! ## Status
+//! ## Architecture
 //!
-//! Early research prototype.  Currently implemented:
-//! - `profile` — display EOTF, white point, DPI
-//! - `layout` — subpixel layout enum + pentile RGBG geometry and kernels
-//! - `glyph` — output buffer type
+//! ```text
+//! font::loader  →  glyph::GlyphBuffer  →  render::{grayscale,subpixel_aa,oled_aware}
+//!                                                  ↓
+//!                                       subpixel::SubpixelGrid
+//!                                                  ↓
+//!                                         viz::Inspector  (minifb window)
+//! ```
 //!
-//! In progress:
-//! - `raster` — scanline coverage accumulator
-//! - `filter` — full filter pass integrating layout + fringe suppression
+//! ## Status — Phase 1 complete
+//!
+//! Implemented:
+//! - `profile`   — display EOTF, white point, DPI
+//! - `layout`    — subpixel layout enum, pentile RGBG geometry and kernels
+//! - `glyph`     — output buffer type (linear-light RGBA f32)
+//! - `font`      — FreeType font loading and rasterization (grey + LCD modes)
+//! - `subpixel`  — virtual subpixel grid, layout-aware filtering
+//! - `render`    — three rendering strategies: greyscale, subpixel AA, OLED-aware
+//! - `viz`       — zoomable subpixel inspector (minifb, keyboard-controlled)
+//!
+//! In progress (Phase 2):
+//! - `simulate`  — optical blur, subpixel bleed, gamma-aware reconstruction
 
+pub mod font;
 pub mod glyph;
 pub mod layout;
 pub mod profile;
+pub mod render;
+pub mod subpixel;
+pub mod viz;

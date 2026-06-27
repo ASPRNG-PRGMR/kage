@@ -1,1 +1,0 @@
-/home/noobiegg/Documents/gitHub_stuff/kage/target/debug/libkage.rlib: /home/noobiegg/Documents/gitHub_stuff/kage/src/glyph.rs /home/noobiegg/Documents/gitHub_stuff/kage/src/layout/mod.rs /home/noobiegg/Documents/gitHub_stuff/kage/src/layout/pentile.rs /home/noobiegg/Documents/gitHub_stuff/kage/src/lib.rs /home/noobiegg/Documents/gitHub_stuff/kage/src/profile.rs
