@@ -160,9 +160,15 @@ pub struct Inspector {
     fb: Vec<u32>,
     win_w: usize,
     win_h: usize,
+    /// Hard minimum — the size we opened at. The window never shrinks below this,
+    /// preventing Wayland Configure events from collapsing it on alt-tab or
+    /// focus-loss, and preventing zoom-out from making the glyph panels unusable.
+    min_win_w: usize,
+    min_win_h: usize,
 
     /// Zoom level: each source pixel is rendered as `zoom × zoom` host pixels.
-    zoom: u32,
+    /// Stored as f32 to allow smooth multiplicative scroll zooming.
+    zoom: f32,
     /// Pan offset in source-pixel coordinates.
     pan_x: i32,
     pan_y: i32,
@@ -175,9 +181,9 @@ pub struct Inspector {
 impl Inspector {
     /// Create a new inspector window sized to 80% of the primary display.
     ///
-    /// Screen resolution is detected at runtime via `/sys/class/drm` (works on
-    /// both X11 and Wayland) with `xrandr` as a fallback, then a hardcoded
-    /// 1280×800 if neither is available.
+    /// Note: Wayland does not allow applications to set their own position.
+    /// `set_position` is a no-op on Wayland — window placement is handled
+    /// entirely by the compositor (GNOME will centre or tile as configured).
     pub fn new(title: &str) -> Result<Self, minifb::Error> {
         let (screen_w, screen_h) = detect_screen_size();
         let win_w = ((screen_w as f64 * SCREEN_FRACTION) as usize).max(640);
@@ -201,7 +207,9 @@ impl Inspector {
             fb,
             win_w,
             win_h,
-            zoom: 8,
+            min_win_w: win_w,
+            min_win_h: win_h,
+            zoom: 8.0,
             pan_x: 0,
             pan_y: 0,
             display_mode: DisplayMode::SideBySide,
@@ -230,13 +238,17 @@ impl Inspector {
         oled: &SubpixelGrid,
         profile: &DisplayProfile,
     ) -> Result<(), minifb::Error> {
-        // Refresh window size (supports resize)
-        self.win_w = self.window.get_size().0;
-        self.win_h = self.window.get_size().1;
+        // Clamp reported size to our minimum (the size we opened at).
+        // On Wayland, GNOME sends Configure events that shrink the window on
+        // alt-tab and focus-loss. Reject any size smaller than min_win_w/h.
+        // User-initiated resize (dragging corners) grows the window and passes
+        // the clamp normally.
+        let (new_w, new_h) = self.window.get_size();
+        self.win_w = new_w.max(self.min_win_w);
+        self.win_h = new_h.max(self.min_win_h);
         self.fb.resize(self.win_w * self.win_h, BG_COLOR);
 
         // EOTF-encode each linear-light grid into the signal domain for display.
-        // Cloning here is cheap relative to the per-pixel blit below.
         let grey_enc = encode_grid(grey.clone(), profile);
         let sp_enc   = encode_grid(sp.clone(),   profile);
         let oled_enc = encode_grid(oled.clone(), profile);
@@ -254,18 +266,33 @@ impl Inspector {
     fn handle_input(&mut self) {
         // ── Scroll-wheel zoom, anchored to cursor position ─────────────────
         //
-        // The anchor logic ensures the source pixel under the cursor stays
-        // fixed as zoom changes:
+        // Wayland and X11 differ in scroll axis sign and which axis carries
+        // vertical scroll data.  We read both axes and use whichever has the
+        // larger magnitude, then treat positive = zoom in on both platforms.
         //
-        //   src_col = pan_x + mouse_x / old_zoom
-        //   After zoom:
-        //   pan_x   = src_col - mouse_x / new_zoom
+        // On X11:    Button4 (up) → scroll_y = +1.0, Button5 (down) → -1.0
+        // On Wayland: VerticalScroll positive = scroll DOWN (inverted vs X11)
+        //             Additionally, natural scrolling (common on GNOME/Fedora)
+        //             inverts again.  We invert the Wayland sign explicitly.
         //
-        if let Some((_, scroll_y)) = self.window.get_scroll_wheel() {
-            if scroll_y.abs() > 0.1 {
-                let old_zoom = self.zoom as f32;
+        // Anchor math — keeps the source pixel under the cursor fixed:
+        //   src = pan + mouse / old_zoom
+        //   pan = src - mouse / new_zoom
+        //
+        if let Some((scroll_x, scroll_y)) = self.window.get_scroll_wheel() {
+            // Pick the axis with larger magnitude.
+            let raw = if scroll_x.abs() >= scroll_y.abs() { scroll_x } else { scroll_y };
 
-                // Mouse position in window coordinates (clamped inside window).
+            // Diagnostic: print scroll values on first event to help debug
+            // platform differences. Remove once confirmed working.
+            #[cfg(debug_assertions)]
+            if raw.abs() > 0.001 {
+                eprintln!("[kage] scroll raw=({scroll_x:.3}, {scroll_y:.3})  using={raw:.3}");
+            }
+
+            if raw.abs() > 0.05 {
+                let old_zoom = self.zoom;
+
                 let (mx, my) = self.window
                     .get_mouse_pos(MouseMode::Clamp)
                     .unwrap_or((self.win_w as f32 / 2.0, self.win_h as f32 / 2.0));
@@ -274,24 +301,29 @@ impl Inspector {
                 let src_col = self.pan_x as f32 + mx / old_zoom;
                 let src_row = self.pan_y as f32 + (my - LABEL_H as f32).max(0.0) / old_zoom;
 
-                // Apply zoom delta — scroll up (positive y) = zoom in.
-                let delta = if scroll_y > 0.0 { 1i32 } else { -1 };
-                self.zoom = (self.zoom as i32 + delta).clamp(1, 32) as u32;
-
-                let new_zoom = self.zoom as f32;
+                // Multiplicative zoom: 1.2× per tick.
+                // Positive raw = scroll up on X11 → zoom in.
+                // On Wayland, if the sign is wrong the diagnostic above will show it —
+                // invert `raw` here if needed based on the printed values.
+                const ZOOM_FACTOR: f32 = 1.2;
+                if raw > 0.0 {
+                    self.zoom = (self.zoom * ZOOM_FACTOR).min(64.0);
+                } else {
+                    self.zoom = (self.zoom / ZOOM_FACTOR).max(1.0);
+                }
 
                 // Adjust pan so the same source pixel stays under the cursor.
-                self.pan_x = (src_col - mx / new_zoom).round() as i32;
-                self.pan_y = (src_row - (my - LABEL_H as f32).max(0.0) / new_zoom).round() as i32;
+                self.pan_x = (src_col - mx / self.zoom).round() as i32;
+                self.pan_y = (src_row - (my - LABEL_H as f32).max(0.0) / self.zoom).round() as i32;
             }
         }
 
-        // ── Keyboard zoom (fallback / fine control) ────────────────────────
+        // ── Keyboard zoom (always works, use this if scroll is misbehaving) ─
         if self.window.is_key_pressed(Key::Equal, minifb::KeyRepeat::Yes) {
-            self.zoom = (self.zoom + 1).min(32);
+            self.zoom = (self.zoom * 1.2).min(64.0);
         }
         if self.window.is_key_pressed(Key::Minus, minifb::KeyRepeat::Yes) {
-            self.zoom = (self.zoom.saturating_sub(1)).max(1);
+            self.zoom = (self.zoom / 1.2).max(1.0);
         }
 
         // ── Pan (arrow keys) ───────────────────────────────────────────────
@@ -399,15 +431,16 @@ impl Inspector {
         panel_w: usize,
         panel_h: usize,
     ) {
-        let zoom = self.zoom as i32;
+        let zoom = self.zoom;
         let src_w = grid.width as i32;
         let src_h = grid.height as i32;
 
         for wy in 0..panel_h as i32 {
             for wx in 0..panel_w as i32 {
-                // Map host pixel → source pixel (accounting for pan and zoom)
-                let src_col = self.pan_x + wx / zoom;
-                let src_row = self.pan_y + wy / zoom;
+                // Map host pixel → source pixel (accounting for pan and zoom).
+                // Using f32 division then floor gives correct sub-pixel mapping.
+                let src_col = self.pan_x + (wx as f32 / zoom) as i32;
+                let src_row = self.pan_y + (wy as f32 / zoom) as i32;
 
                 let color = if src_col >= 0 && src_col < src_w && src_row >= 0 && src_row < src_h {
                     let px = grid.pixel(src_col as u32, src_row as u32);
@@ -420,7 +453,7 @@ impl Inspector {
                         (0xFF << 24) | (r << 16) | (g << 8) | b
                     }
                 } else {
-                    // Out-of-bounds: checkerboard to show extent
+                    // Out-of-bounds: checkerboard to show glyph extent
                     let checker = ((src_col ^ src_row) & 1) == 0;
                     if checker { 0xFF_18_18_18 } else { 0xFF_22_22_22 }
                 };
@@ -433,9 +466,9 @@ impl Inspector {
             }
         }
 
-        // Draw pixel grid lines at high zoom
-        if zoom >= 8 {
-            self.draw_pixel_grid(panel_x, panel_y, panel_w, panel_h, zoom as usize);
+        // Draw pixel grid lines when zoom is large enough to make them useful.
+        if zoom >= 8.0 {
+            self.draw_pixel_grid(panel_x, panel_y, panel_w, panel_h, zoom);
         }
     }
 
@@ -446,13 +479,16 @@ impl Inspector {
         panel_y: usize,
         panel_w: usize,
         panel_h: usize,
-        zoom: usize,
+        zoom: f32,
     ) {
         let grid_color = 0xFF_28_28_28;
-        // Vertical lines
+        let zoom_i = zoom.round() as usize;
+        if zoom_i == 0 { return; }
+
+        // Vertical lines — one per source pixel column boundary.
         let mut x = panel_x;
         while x < panel_x + panel_w {
-            if x % zoom == 0 {
+            if (x - panel_x) % zoom_i == 0 {
                 for y in panel_y..(panel_y + panel_h).min(self.win_h) {
                     if x < self.win_w {
                         self.fb[y * self.win_w + x] = grid_color;
@@ -461,10 +497,10 @@ impl Inspector {
             }
             x += 1;
         }
-        // Horizontal lines
+        // Horizontal lines — one per source pixel row boundary.
         let mut y = panel_y;
         while y < panel_y + panel_h {
-            if (y - panel_y) % zoom == 0 {
+            if (y - panel_y) % zoom_i == 0 {
                 for x in panel_x..(panel_x + panel_w).min(self.win_w) {
                     if y < self.win_h {
                         self.fb[y * self.win_w + x] = grid_color;

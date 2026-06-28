@@ -205,3 +205,226 @@ The `bundled` feature activates a `cc::Build` path in `freetype-sys/build.rs` th
 | CI / reproducibility | Fragile across distros | Hermetic |
 
 For a research project where portability matters more than binary size, bundled is the better default.
+
+---
+
+## Session 4 — Scroll-wheel zoom + adaptive window sizing
+**Date:** 2026-06-28
+
+### Changes
+
+**`src/viz/inspector.rs`** only — no other files touched.
+
+**Scroll-wheel zoom anchored to cursor:**
+
+`get_scroll_wheel()` returns `Option<(f32, f32)>` where `y > 0` is scroll-up (zoom in). The anchor math keeps the source pixel under the cursor fixed as zoom changes:
+
+```
+src = pan + mouse / old_zoom      ← source pixel under cursor before
+pan = src - mouse / new_zoom      ← pan that keeps it there after
+```
+
+The label strip height (`LABEL_H = 20px`) is subtracted from the mouse y coordinate so the anchor is in the glyph area coordinate space, not the full window coordinate space.
+
+Zoom range stays 1–32×. Each scroll tick moves by 1 zoom level.
+
+**Adaptive window sizing (80% of screen):**
+
+minifb exposes no screen size query and no fullscreen API. The window is instead sized to 80% of the detected primary display resolution at startup, which feels native without covering the taskbar.
+
+Screen resolution is detected via a three-step fallback chain:
+
+1. **`/sys/class/drm/card*/card*-*/modes`** — reads kernel DRM sysfs, works on both X11 and Wayland, zero subprocesses. First line of the `modes` file is the preferred/active resolution in `WxH` format.
+2. **`xrandr` subprocess** — parses the line containing `*` (active mode marker). X11 and XWayland only.
+3. **Hardcoded fallback** — 1280×800 if neither source is readable.
+
+The computed size has a minimum floor of 640×400 so the window is always usable even if the detection returns a tiny value. `resize: true` remains set so the WM can resize or maximise freely after open.
+
+**`MouseMode::Clamp`** added to imports — returns mouse coords clamped inside the window boundary, giving no negative coords when the cursor is at the edge during a scroll.
+
+---
+
+## Session 5 — Phase 1.5: Pipeline refactor (linear-light renderers)
+**Date:** 2026-06-28
+
+### Why this had to happen before Phase 2
+
+Phase 2 adds optical blur simulation between the renderer output and the framebuffer. Blur is a convolution — it must happen in linear light. The old pipeline applied EOTF encoding inside each renderer, meaning the grids reaching the inspector were already in sRGB signal space. Blurring a gamma-encoded signal produces the wrong result: dark regions would blur as if they carried more energy than they physically do.
+
+The fix is to push EOTF encoding to the very end of the pipeline, after all filtering and simulation are complete.
+
+### What changed
+
+**`src/render/grayscale.rs`**
+- Removed `profile.eotf.encode()` call inside the pixel loop
+- Now returns raw linear-light coverage values
+- Tests updated: `output_is_linear_not_encoded` replaces the old `eotf_is_applied` test (which was asserting the wrong behaviour)
+
+**`src/render/subpixel_aa.rs`**
+- `encode_grid()` call removed from `render_subpixel()`
+- `encode_grid()` function itself moved to `render/mod.rs`
+- Now returns linear-light `SubpixelGrid` directly from `SubpixelGrid::from_glyph()`
+
+**`src/render/oled_aware.rs`**
+- `use super::subpixel_aa::encode_grid` import removed
+- `encode_grid()` call removed
+- Returns linear-light grid directly
+
+**`src/render/mod.rs`**
+- `encode_grid()` moved here and made `pub` — single encoding point for the whole crate
+- Doc comment updated to explain the linear-light contract
+- New tests: `encode_grid_applies_eotf`, `encode_grid_is_idempotent_at_endpoints`
+
+**`src/viz/inspector.rs`**
+- `update()` gains a `profile: &DisplayProfile` parameter
+- Calls `encode_grid(grid.clone(), profile)` for each of the three grids before passing to `draw()`
+- `use crate::render::encode_grid` and `use crate::profile::DisplayProfile` added to imports
+- The clone cost is negligible: grids are small (glyph-sized, not full-screen)
+
+**`src/main.rs`**
+- `inspector.update()` call gains `&profile` as fourth argument
+
+### Pipeline before and after
+
+```
+Before:
+  render() → EOTF-encoded SubpixelGrid → Inspector blits directly
+
+After:
+  render() → linear SubpixelGrid → encode_grid() → Inspector blits
+                                 ↗
+                     simulate::* (Phase 2) plugs in here
+```
+
+### Test strategy note
+
+The comparison tests (`fringe_suppression_reduces_channel_spread_at_edge`, `no_suppression_in_smooth_region`) now compare two linear-light grids against each other. This is actually more correct than before: we're measuring the raw filter output difference, unconfounded by the nonlinearity of sRGB encoding.
+
+---
+
+## Session 6 — Scroll zoom fix + window centering
+**Date:** 2026-06-28
+
+### Issues reported
+
+1. **Scroll moved the view left/right instead of zooming.** Upscroll panned right, downscroll panned left.
+2. **Window opened in the top-left corner** instead of the centre of the screen.
+
+### Root cause — scroll
+
+The old zoom was `u32`, delta was `±1`. At zoom=8, changing to 9 is an 11% step — barely noticeable visually. The anchor pan correction (`pan = src - mouse/new_zoom`) was proportionally larger than the zoom change and dominated the frame, making it look like pure panning with no zoom. The fix is multiplicative zoom: each scroll tick multiplies by `1.2×` (zoom in) or divides by `1.2×` (zoom out). At any zoom level this is a consistent 20% visual step — clearly perceptible and correctly anchored.
+
+`zoom` field changed from `u32` to `f32`. All downstream uses updated:
+- `draw_panel`: pixel mapping uses `(wx as f32 / zoom) as i32` instead of `wx / zoom as i32`
+- `draw_pixel_grid`: takes `zoom: f32`, rounds to `usize` for modulo grid line positioning
+- `draw_pixel_grid`: fixed the vertical line condition from `x % zoom == 0` (absolute) to `(x - panel_x) % zoom_i == 0` (relative to panel origin — the old code drew grid lines at wrong positions when panel_x was non-zero)
+- Keyboard `+`/`-` also updated to use the same `1.2×` multiplier for consistency
+- Zoom range: 1.0–64.0 (extended upper bound from 32 to 64 since float zoom allows finer control)
+
+### Root cause — centering
+
+minifb opens windows at a system-default position (top-left or WM-chosen). `set_position()` exists on `Window` and takes `(isize, isize)` in screen coordinates. Called immediately after `Window::new()`:
+
+```rust
+let cx = ((screen_w - win_w) / 2) as isize;
+let cy = ((screen_h - win_h) / 2) as isize;
+win.set_position(cx, cy);
+```
+
+The screen dimensions come from the same `detect_screen_size()` already used for sizing, so no new detection code was needed.
+
+### Files changed
+
+`src/viz/inspector.rs` only.
+
+---
+
+## Session 7 — Scroll zoom: Wayland axis handling
+**Date:** 2026-06-28
+
+### Issue
+
+Scroll still panned left/right instead of zooming, confirmed in screenshot.
+
+### Root cause
+
+Two things were wrong:
+
+**1. We were only reading `scroll_y` and discarding `scroll_x`.**
+On Wayland (`Axis::VerticalScroll → scroll_y`, `Axis::HorizontalScroll → scroll_x`) this should be fine — but on some Wayland compositors or with certain pointer devices, vertical scroll comes through on `scroll_x` instead. The fix: read both axes, use whichever has the larger magnitude.
+
+**2. Wayland scroll sign vs X11.**
+On X11: `Button4` (scroll up) → `scroll_y = +1.0`. Positive = up = zoom in. Correct.
+On Wayland: `Axis::VerticalScroll` positive = scroll **down** (inverted relative to X11). Additionally, GNOME on Fedora enables "natural scrolling" by default which inverts again. The net effect depends on the user's settings. A diagnostic print (`eprintln!`) is added in debug builds (`#[cfg(debug_assertions)]`) so the raw scroll values can be observed in the terminal. If zoom goes the wrong direction, the sign of `raw` in the code is the thing to flip.
+
+**3. Threshold too high.**
+Old threshold was `> 0.1`. Wayland scroll values can be fractional and accumulate differently. Lowered to `> 0.05`.
+
+### What the diagnostic shows
+
+Run with `cargo run -- ...` (debug build) and scroll. The terminal will print:
+```
+[kage] scroll raw=(-0.300, 0.000)  using=-0.300
+```
+This tells you which axis is active and what sign. If zoom goes the wrong direction swap the `> 0.0` / `< 0.0` condition. This print only appears in debug builds and will be removed once confirmed working.
+
+### Keyboard zoom
+
+`+`/`-` keys always work regardless of platform scroll issues. Use these as a workaround while diagnosing.
+
+---
+
+## Session 8 — Alt-tab shrink fix; scroll still under investigation
+**Date:** 2026-06-28
+
+### Alt-tab window shrinking
+
+On Wayland, when focus is lost (alt-tab, switching workspaces), GNOME sends an XDG Toplevel `Configure` event with a compositor-chosen smaller size. minifb accepts it if `resize: true` is set, causing the window to shrink. There is no `set_min_size` API on minifb's `Window`.
+
+Fix: only accept size changes that are **larger** than the current size. This allows user-initiated resize (dragging a corner always increases size) while ignoring compositor-driven shrinks during focus loss.
+
+```rust
+let (new_w, new_h) = self.window.get_size();
+if new_w > self.win_w || new_h > self.win_h {
+    self.win_w = new_w;
+    self.win_h = new_h;
+}
+```
+
+### Scroll — still needs terminal diagnostic
+
+The scroll diagnostic (`[kage] scroll raw=(...)`) prints to stderr when running with `cargo run` (debug build). Run the app from a terminal, scroll, and check what it prints. Three possible outcomes:
+
+1. **Nothing prints** — scroll events aren't reaching the app at all (Wayland seat version issue or compositor not forwarding them)
+2. **`scroll_x` is non-zero, `scroll_y` is zero** — events on wrong axis (code already handles this with `max(|x|, |y|)`)
+3. **Values print but zoom goes wrong direction** — sign is inverted; swap the `> 0.0` condition
+
+---
+
+## Session 9 — Window sizing: hard minimum clamp; centering not possible on Wayland
+**Date:** 2026-06-28
+
+### Centering
+
+`set_position()` is a no-op on Wayland. The Wayland protocol does not allow applications to set their own window position — placement is exclusively the compositor's job. On GNOME Wayland, new windows are placed by Mutter based on its own rules (usually top-left or cascaded). There is no workaround available through minifb. The `set_position()` call was removed from `Inspector::new()`. For Phase 4, switching to `winit` would allow using `request_inner_size` and the compositor will honour placement hints via xdg-activation or similar, but still not guarantee position.
+
+### Alt-tab shrinking / initial tiny window
+
+Root cause: on Wayland, `get_size()` returns whatever size the compositor last sent via `Configure`. GNOME sends a Configure immediately on window creation and again on focus-loss. The previous "only grow" fix failed because `win_w/win_h` was initialised from `get_size()` in the struct, not from the computed target size.
+
+Fix: added `min_win_w` and `min_win_h` fields, set to the intended open size computed before `Window::new()`. Every frame, `get_size()` is clamped to these minimums:
+
+```rust
+self.win_w = new_w.max(self.min_win_w);
+self.win_h = new_h.max(self.min_win_h);
+```
+
+This also satisfies the "don't shrink beyond glyph bounds" requirement — the minimum is the size at which all three panels are fully visible and the glyph fills the panel area at the initial zoom level.
+
+### What cannot be fixed in minifb
+
+- Window position on Wayland (compositor-controlled)
+- True minimum size enforcement (no `set_min_size` API)
+- GNOME overview thumbnail scaling (that's the WM, not our window)
+
+All three are fixable by switching to `winit` in Phase 4.
