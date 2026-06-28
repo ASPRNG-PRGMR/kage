@@ -428,3 +428,73 @@ This also satisfies the "don't shrink beyond glyph bounds" requirement — the m
 - GNOME overview thumbnail scaling (that's the WM, not our window)
 
 All three are fixable by switching to `winit` in Phase 4.
+
+---
+
+## Session 10 — Phase 2: Optical simulation + mouse drag + simulate toggle
+**Date:** 2026-06-29
+
+### New files
+
+**`src/simulate/psf.rs`** — Gaussian PSF and separable 2-D convolution.
+`gaussian_kernel(sigma, radius)` builds a normalised 1-D kernel. `convolve_separable(grid, kr, kg, kb)` applies two 1-D passes (horizontal then vertical) — O(n·k) instead of O(n·k²). Border handling is clamp-to-edge. Per-channel kernels allow R, G, B to have different blur widths.
+
+**`src/simulate/bleed.rs`** — `BleedProfile` with per-channel sigma multipliers. `oled_default()` uses red_mult=1.20, green_mult=1.00, blue_mult=1.10 based on published OLED aperture characterisation. `kernels(base_sigma)` produces the three ready-to-use kernel vecs.
+
+**`src/simulate/gamma.rs`** — Linear-light correctness documentation and guards. `check_linear()` heuristic emits a warning in debug builds if values suggest gamma-encoded input. `viewing_distance_to_sigma()` converts physical panel + viewing geometry to a PSF sigma in pixel units.
+
+**`src/simulate/mod.rs`** — `SimulationParams` with named presets (`oled_default`, `subtle`, `strong`, `identity`) and `from_viewing_distance()` for physically-derived sigma. `simulate()` dispatch — identity passthrough when sigma=0.
+
+### Modified files
+
+**`src/main.rs`**
+- New CLI flags: `--simulate`, `--psf-sigma <f32>`, `--viewing-dist <f32>`
+- Renders six grids (3 raw + 3 simulated) before the event loop
+- Passes all six to `inspector.update()`
+
+**`src/viz/inspector.rs`**
+- `new()` gains `simulate_available: bool` parameter
+- New fields: `simulate_mode`, `simulate_available`, `drag_last: Option<(f32,f32)>`
+- `update()` takes 6 grids + profile; selects raw or simulated based on `simulate_mode`
+- **`S` key** — toggles raw ↔ simulated view; prints a hint if `--simulate` wasn't passed
+- **Mouse drag** — left-click + drag pans all panels; delta in host pixels divided by zoom gives source-pixel delta
+- Label accent bars brighten when simulate mode is active (visual confirmation of toggle state)
+
+**`src/lib.rs`** — `pub mod simulate` added.
+
+### Pipeline
+
+```
+render() ──▶ linear SubpixelGrid (raw)
+                │
+           simulate() ──▶ linear SubpixelGrid (PSF blurred)
+                │                │
+                └────────────────┘
+                         │
+                   S key toggles
+                         │
+                  encode_grid() ──▶ Inspector framebuffer
+```
+
+### Physical defaults
+
+- Base sigma: 0.45px (109dpi OLED, 500mm viewing distance, 0.5 arcmin PSF FWHM)
+- Red bleed: 1.20× base sigma
+- Green bleed: 1.00× base sigma  
+- Blue bleed: 1.10× base sigma
+
+### Usage
+
+```bash
+# Raw rendering only (Phase 1 behaviour unchanged)
+cargo run --release -- --font /path/to/font.ttf --glyph g --layout pentile
+
+# With optical simulation (press S to toggle)
+cargo run --release -- --font /path/to/font.ttf --glyph g --layout pentile --simulate
+
+# Custom blur strength
+cargo run --release -- --font /path/to/font.ttf --glyph g --simulate --psf-sigma 1.2
+
+# Physically derived sigma from viewing distance
+cargo run --release -- --font /path/to/font.ttf --glyph g --simulate --viewing-dist 600
+```

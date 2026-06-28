@@ -31,7 +31,7 @@
 //!                                         viz::Inspector  (minifb window)
 //! ```
 //!
-//! ## Status — Phase 1 complete
+//! ## Status — Phase 2 in progress
 //!
 //! Implemented:
 //! - `profile`   — display EOTF, white point, DPI
@@ -40,15 +40,14 @@
 //! - `font`      — FreeType font loading and rasterization (grey + LCD modes)
 //! - `subpixel`  — virtual subpixel grid, layout-aware filtering
 //! - `render`    — three rendering strategies: greyscale, subpixel AA, OLED-aware
+//! - `simulate`  — optical PSF blur, per-channel subpixel bleed (Phase 2)
 //! - `viz`       — zoomable subpixel inspector (minifb, keyboard-controlled)
-//!
-//! In progress (Phase 2):
-//! - `simulate`  — optical blur, subpixel bleed, gamma-aware reconstruction
 
 pub mod font;
 pub mod glyph;
 pub mod layout;
 pub mod profile;
 pub mod render;
+pub mod simulate;
 pub mod subpixel;
 pub mod viz;

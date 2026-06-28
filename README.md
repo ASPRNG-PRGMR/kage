@@ -38,8 +38,8 @@ This project explores a third path: **display-aware perceptual text reconstructi
 |-------|--------|-------------|
 | **Phase 1** | ✅ Complete | Rendering sandbox + zoomable inspector |
 | **Phase 1.5** | ✅ Complete | Pipeline refactor — renderers return linear light |
-| **Phase 2** | 🔲 Next | Optical blur simulation, subpixel bleed, gamma reconstruction |
-| **Phase 3** | 🔲 Planned | Experimental rendering: luma/chroma decoupling, frequency-aware |
+| **Phase 2** | ✅ Complete | Optical PSF blur, per-channel bleed, simulate/raw toggle |
+| **Phase 3** | 🔲 Next | Experimental rendering: luma/chroma decoupling, frequency-aware |
 | **Phase 4** | 🔲 Planned | GPU acceleration (OpenGL → Vulkan) |
 
 ---

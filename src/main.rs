@@ -1,12 +1,13 @@
 //! KAGE — entry point and CLI.
 //!
 //! Usage:
-//!   kage --font <path> --glyph <char> --layout <layout> [--size <px>] [--no-fringe]
+//!   kage --font <path> --glyph <char> --layout <layout> [options]
 //!
 //! Examples:
 //!   kage --font /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf --glyph A
 //!   kage --font ./assets/fonts/test.ttf --glyph g --layout pentile --size 96
-//!   kage --font ./assets/fonts/test.ttf --glyph Q --layout rgb --no-fringe
+//!   kage --font ./assets/fonts/test.ttf --glyph Q --layout rgb --simulate
+//!   kage --font ./assets/fonts/test.ttf --glyph g --simulate --psf-sigma 0.8
 
 use clap::Parser;
 use kage::{
@@ -14,6 +15,7 @@ use kage::{
     layout::SubpixelLayout,
     profile::DisplayProfile,
     render::{render, RenderMode},
+    simulate::{simulate, SimulationParams},
     viz::Inspector,
 };
 
@@ -54,6 +56,22 @@ struct Args {
     /// Device pixel ratio (1.0 = standard, 2.0 = HiDPI).
     #[arg(long, default_value_t = 1.0)]
     dpr: f32,
+
+    /// Enable Phase 2 optical blur simulation.
+    /// Press S in the inspector to toggle between raw and simulated views.
+    #[arg(long, default_value_t = false)]
+    simulate: bool,
+
+    /// PSF sigma in pixel units for optical blur simulation.
+    /// Overrides --viewing-dist. Default: 0.45 (typical 109dpi OLED at 50cm).
+    #[arg(long)]
+    psf_sigma: Option<f32>,
+
+    /// Viewing distance in mm for physically-derived PSF sigma.
+    /// Uses display DPI to convert to pixel units.
+    /// Ignored if --psf-sigma is set.
+    #[arg(long, default_value_t = 500.0)]
+    viewing_dist: f32,
 }
 
 fn parse_layout(s: &str) -> SubpixelLayout {
@@ -83,13 +101,31 @@ fn main() {
 
     let layout = parse_layout(&args.layout);
 
+    // ── Simulation params ──────────────────────────────────────────────────────
+    let sim_params = if args.simulate {
+        if let Some(sigma) = args.psf_sigma {
+            let mut p = SimulationParams::oled_default();
+            p.sigma = sigma;
+            p
+        } else {
+            SimulationParams::from_viewing_distance(&profile, args.viewing_dist, 0.5)
+        }
+    } else {
+        SimulationParams::identity()
+    };
+
     println!("KAGE — Kinetic Adaptive Glyph Engine");
-    println!("  Font:   {}", args.font);
-    println!("  Glyph:  '{}'  (U+{:04X})", args.glyph, args.glyph as u32);
-    println!("  Size:   {}px", args.size);
-    println!("  Layout: {:?}", layout);
-    println!("  DPI:    {} (DPR {}×)", profile.dpi, profile.device_pixel_ratio);
-    println!("  HiDPI:  {}", profile.is_hidpi());
+    println!("  Font:       {}", args.font);
+    println!("  Glyph:      '{}'  (U+{:04X})", args.glyph, args.glyph as u32);
+    println!("  Size:       {}px", args.size);
+    println!("  Layout:     {:?}", layout);
+    println!("  DPI:        {} (DPR {}×)", profile.dpi, profile.device_pixel_ratio);
+    println!("  HiDPI:      {}", profile.is_hidpi());
+    if args.simulate {
+        println!("  Simulate:   ON  (sigma={:.3}px)", sim_params.sigma);
+    } else {
+        println!("  Simulate:   OFF  (press S in inspector to toggle)");
+    }
     println!();
 
     // ── Font loading ───────────────────────────────────────────────────────────
@@ -102,8 +138,6 @@ fn main() {
     };
 
     // ── Rasterize glyph ────────────────────────────────────────────────────────
-    // We use the greyscale FreeType bitmap as the source coverage map.
-    // The render layer applies the per-layout filter to produce per-channel output.
     let bitmap = match face.rasterize_grey(args.glyph) {
         Some(b) => b,
         None => {
@@ -122,23 +156,36 @@ fn main() {
 
     let glyph_buf = bitmap.into_glyph_buffer();
 
-    // ── Render three modes ─────────────────────────────────────────────────────
-    let grey_grid = render(&glyph_buf, RenderMode::Greyscale,  layout, &profile);
-    let sp_grid   = render(&glyph_buf, RenderMode::SubpixelAa, layout, &profile);
-    let oled_grid = render(&glyph_buf, RenderMode::OledAware,  layout, &profile);
+    // ── Render (linear light) ──────────────────────────────────────────────────
+    let grey_raw  = render(&glyph_buf, RenderMode::Greyscale,  layout, &profile);
+    let sp_raw    = render(&glyph_buf, RenderMode::SubpixelAa, layout, &profile);
+    let oled_raw  = render(&glyph_buf, RenderMode::OledAware,  layout, &profile);
 
-    println!("Rendered three grids:");
-    println!("  Greyscale AA   — {}×{}", grey_grid.width, grey_grid.height);
-    println!("  Subpixel AA    — {}×{}", sp_grid.width,   sp_grid.height);
-    println!("  OLED-Aware     — {}×{}", oled_grid.width, oled_grid.height);
+    // ── Simulate (linear light — PSF convolution) ──────────────────────────────
+    let grey_sim  = simulate(&grey_raw,  &sim_params);
+    let sp_sim    = simulate(&sp_raw,    &sim_params);
+    let oled_sim  = simulate(&oled_raw,  &sim_params);
+
+    println!("Rendered three grids ({}×{}):", grey_raw.width, grey_raw.height);
+    println!("  Greyscale AA, Subpixel AA, OLED-Aware");
+    if args.simulate {
+        println!("  Simulated grids ready (PSF sigma={:.3}px)", sim_params.sigma);
+    }
     println!();
-    println!("Controls: +/- zoom · Arrows pan · 1/2/3 single panel · A side-by-side · H heatmap · Esc quit");
+    println!("Controls:");
+    println!("  Scroll/+/-  zoom (anchored to cursor)");
+    println!("  Click+drag  pan");
+    println!("  Arrow keys  pan (fine)");
+    println!("  1/2/3       single panel  |  A  side-by-side");
+    println!("  S           toggle raw ↔ simulated");
+    println!("  H           heatmap overlay");
+    println!("  Esc         quit");
 
     // ── Inspector window ───────────────────────────────────────────────────────
-    let mut inspector = match Inspector::new(&format!(
-        "KAGE — '{}' @ {}px — {:?}",
-        args.glyph, args.size, layout
-    )) {
+    let mut inspector = match Inspector::new(
+        &format!("KAGE — '{}' @ {}px — {:?}", args.glyph, args.size, layout),
+        args.simulate,
+    ) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("Failed to open inspector window: {e}");
@@ -148,7 +195,11 @@ fn main() {
 
     // Main event loop
     while inspector.is_open() {
-        if let Err(e) = inspector.update(&grey_grid, &sp_grid, &oled_grid, &profile) {
+        if let Err(e) = inspector.update(
+            &grey_raw,  &sp_raw,  &oled_raw,
+            &grey_sim,  &sp_sim,  &oled_sim,
+            &profile,
+        ) {
             eprintln!("Inspector error: {e}");
             break;
         }

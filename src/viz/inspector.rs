@@ -160,20 +160,24 @@ pub struct Inspector {
     fb: Vec<u32>,
     win_w: usize,
     win_h: usize,
-    /// Hard minimum — the size we opened at. The window never shrinks below this,
-    /// preventing Wayland Configure events from collapsing it on alt-tab or
-    /// focus-loss, and preventing zoom-out from making the glyph panels unusable.
+    /// Hard minimum — the size we opened at.
     min_win_w: usize,
     min_win_h: usize,
 
     /// Zoom level: each source pixel is rendered as `zoom × zoom` host pixels.
-    /// Stored as f32 to allow smooth multiplicative scroll zooming.
     zoom: f32,
     /// Pan offset in source-pixel coordinates.
     pan_x: i32,
     pan_y: i32,
 
+    /// Mouse drag state for panning.
+    drag_last: Option<(f32, f32)>,
+
     display_mode: DisplayMode,
+    /// When true, show simulated grids instead of raw render grids.
+    simulate_mode: bool,
+    /// Whether simulation data is available (--simulate was passed).
+    simulate_available: bool,
     /// When true, R/G/B channels are shown as false-colour heatmaps.
     heatmap: bool,
 }
@@ -181,10 +185,9 @@ pub struct Inspector {
 impl Inspector {
     /// Create a new inspector window sized to 80% of the primary display.
     ///
-    /// Note: Wayland does not allow applications to set their own position.
-    /// `set_position` is a no-op on Wayland — window placement is handled
-    /// entirely by the compositor (GNOME will centre or tile as configured).
-    pub fn new(title: &str) -> Result<Self, minifb::Error> {
+    /// `simulate_available` — whether simulated grids will be passed to `update()`.
+    /// If false, pressing S shows a "simulation not enabled" notice.
+    pub fn new(title: &str, simulate_available: bool) -> Result<Self, minifb::Error> {
         let (screen_w, screen_h) = detect_screen_size();
         let win_w = ((screen_w as f64 * SCREEN_FRACTION) as usize).max(640);
         let win_h = ((screen_h as f64 * SCREEN_FRACTION) as usize).max(400);
@@ -212,7 +215,10 @@ impl Inspector {
             zoom: 8.0,
             pan_x: 0,
             pan_y: 0,
+            drag_last: None,
             display_mode: DisplayMode::SideBySide,
+            simulate_mode: false,
+            simulate_available,
             heatmap: false,
         })
     }
@@ -224,31 +230,33 @@ impl Inspector {
 
     /// Process input events and redraw.
     ///
-    /// Call this once per frame inside your event loop.
-    ///
-    /// # Parameters
-    /// - `grey`    — linear-light output of the greyscale renderer
-    /// - `sp`      — linear-light output of the subpixel AA renderer
-    /// - `oled`    — linear-light output of the OLED-aware renderer
-    /// - `profile` — display profile used to EOTF-encode before blitting
+    /// All grids must be in **linear light** — `encode_grid()` is called
+    /// internally. Press `S` to toggle between raw and simulated views.
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
-        grey: &SubpixelGrid,
-        sp: &SubpixelGrid,
-        oled: &SubpixelGrid,
-        profile: &DisplayProfile,
+        grey_raw:  &SubpixelGrid,
+        sp_raw:    &SubpixelGrid,
+        oled_raw:  &SubpixelGrid,
+        grey_sim:  &SubpixelGrid,
+        sp_sim:    &SubpixelGrid,
+        oled_sim:  &SubpixelGrid,
+        profile:   &DisplayProfile,
     ) -> Result<(), minifb::Error> {
-        // Clamp reported size to our minimum (the size we opened at).
-        // On Wayland, GNOME sends Configure events that shrink the window on
-        // alt-tab and focus-loss. Reject any size smaller than min_win_w/h.
-        // User-initiated resize (dragging corners) grows the window and passes
-        // the clamp normally.
+        // Clamp to minimum size — prevents Wayland Configure shrinking.
         let (new_w, new_h) = self.window.get_size();
         self.win_w = new_w.max(self.min_win_w);
         self.win_h = new_h.max(self.min_win_h);
         self.fb.resize(self.win_w * self.win_h, BG_COLOR);
 
-        // EOTF-encode each linear-light grid into the signal domain for display.
+        // Select raw or simulated grids based on S toggle.
+        let (grey, sp, oled) = if self.simulate_mode {
+            (grey_sim, sp_sim, oled_sim)
+        } else {
+            (grey_raw, sp_raw, oled_raw)
+        };
+
+        // EOTF-encode the selected linear-light grids.
         let grey_enc = encode_grid(grey.clone(), profile);
         let sp_enc   = encode_grid(sp.clone(),   profile);
         let oled_enc = encode_grid(oled.clone(), profile);
@@ -341,6 +349,15 @@ impl Inspector {
             self.pan_y += pan_step;
         }
 
+        // ── Simulate toggle ────────────────────────────────────────────────
+        if self.window.is_key_pressed(Key::S, minifb::KeyRepeat::No) {
+            if self.simulate_available {
+                self.simulate_mode = !self.simulate_mode;
+            } else {
+                eprintln!("[kage] Simulation not enabled — re-run with --simulate");
+            }
+        }
+
         // Display mode
         if self.window.is_key_pressed(Key::Key1, minifb::KeyRepeat::No) {
             self.display_mode = DisplayMode::Greyscale;
@@ -358,6 +375,27 @@ impl Inspector {
         // Heatmap toggle
         if self.window.is_key_pressed(Key::H, minifb::KeyRepeat::No) {
             self.heatmap = !self.heatmap;
+        }
+
+        // ── Mouse drag pan ─────────────────────────────────────────────────
+        //
+        // Left-click and drag pans all panels together.
+        // We track the mouse position from the previous frame and compute the
+        // delta in host pixels, then convert to source pixels via zoom.
+        let mouse_down = self.window.get_mouse_down(minifb::MouseButton::Left);
+        let mouse_pos  = self.window.get_mouse_pos(MouseMode::Clamp)
+            .unwrap_or((0.0, 0.0));
+
+        if mouse_down {
+            if let Some((last_x, last_y)) = self.drag_last {
+                let dx = (mouse_pos.0 - last_x) / self.zoom;
+                let dy = (mouse_pos.1 - last_y) / self.zoom;
+                self.pan_x -= dx.round() as i32;
+                self.pan_y -= dy.round() as i32;
+            }
+            self.drag_last = Some(mouse_pos);
+        } else {
+            self.drag_last = None;
         }
     }
 
@@ -520,15 +558,20 @@ impl Inspector {
         }
     }
 
-    /// Draw a simple coloured label bar (no glyph rendering — solid colour blocks
-    /// approximate text until Phase 4 brings real text rendering to the UI).
-    fn draw_label(&mut self, _text: &str, x_start: usize, width: usize) {
-        // Draw a 4-pixel accent line along the bottom of the label strip
-        // coloured differently per panel to make identification easy.
-        let accent = match _text {
-            t if t.contains("Grey")    => 0xFF_4A_90_D9,  // blue
-            t if t.contains("Clear") || t.contains("Subpixel") => 0xFF_E8_7B_3A, // orange
-            _                           => 0xFF_5A_C9_5A,  // green (OLED-aware)
+    /// Draw a simple coloured label bar along the bottom of the label strip.
+    /// Colour coding: blue = greyscale, orange = subpixel AA, green = OLED-aware.
+    /// A brighter shade indicates simulated mode is active.
+    fn draw_label(&mut self, label: &str, x_start: usize, width: usize) {
+        let accent = match label {
+            t if t.contains("Grey") => {
+                if self.simulate_mode { 0xFF_6A_B0_F5 } else { 0xFF_4A_90_D9 }
+            }
+            t if t.contains("Subpixel") || t.contains("Clear") => {
+                if self.simulate_mode { 0xFF_FF_A0_5A } else { 0xFF_E8_7B_3A }
+            }
+            _ => {
+                if self.simulate_mode { 0xFF_7A_E9_7A } else { 0xFF_5A_C9_5A }
+            }
         };
         let accent_y = LABEL_H.saturating_sub(3);
         for dy in 0..3 {
