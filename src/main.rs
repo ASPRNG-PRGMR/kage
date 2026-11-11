@@ -175,7 +175,10 @@ fn main() {
     // ── Render (linear light) ──────────────────────────────────────────────────
     let grey_raw  = render(&glyph_buf, RenderMode::Greyscale,  layout, &profile);
     let sp_raw    = render(&glyph_buf, RenderMode::SubpixelAa, layout, &profile);
-    let oled_raw  = render(&glyph_buf, RenderMode::OledAware,  layout, &profile);
+    // The OLED-aware path is the layout filter plus fringe suppression, so
+    // with suppression disabled it is the plain subpixel renderer.
+    let oled_mode = if args.no_fringe { RenderMode::SubpixelAa } else { RenderMode::OledAware };
+    let oled_raw  = render(&glyph_buf, oled_mode, layout, &profile);
 
     println!("Rendered three grids ({}×{}):", grey_raw.width, grey_raw.height);
     println!("  Greyscale AA, Subpixel AA, OLED-Aware");
