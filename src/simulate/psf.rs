@@ -74,6 +74,30 @@ pub fn kernel_radius(sigma: f32) -> usize {
 
 // ── Separable 2-D convolution ─────────────────────────────────────────────────
 
+/// How the convolution treats taps that fall outside the grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Border {
+    /// Repeat the nearest edge sample. Keeps a uniform field uniform, and
+    /// suits per-pixel grids where the edge value is a fair guess at what
+    /// lies beyond.
+    Clamp,
+    /// Treat everything outside as black. Correct for an emission map of a
+    /// glyph on a dark background: repeating an edge sample there would
+    /// smear a lit emitter outward into a false bright streak.
+    Zero,
+}
+
+/// Apply a separable Gaussian PSF to a linear-light [`SubpixelGrid`], with
+/// clamp-to-edge borders. See [`convolve_separable_with`].
+pub fn convolve_separable(
+    grid: &SubpixelGrid,
+    kernel_r: &[f32],
+    kernel_g: &[f32],
+    kernel_b: &[f32],
+) -> SubpixelGrid {
+    convolve_separable_with(grid, kernel_r, kernel_g, kernel_b, Border::Clamp)
+}
+
 /// Apply a separable Gaussian PSF to a linear-light [`SubpixelGrid`].
 ///
 /// Two 1-D passes are performed: horizontal (along rows) then vertical
@@ -86,16 +110,18 @@ pub fn kernel_radius(sigma: f32) -> usize {
 /// - `kernel_r`  — 1-D Gaussian kernel for the red channel
 /// - `kernel_g`  — 1-D Gaussian kernel for the green channel
 /// - `kernel_b`  — 1-D Gaussian kernel for the blue channel
+/// - `border`    — how taps outside the grid are handled
 ///
 /// Returns a new grid with the blur applied. The input grid is not modified.
 ///
 /// # Panics
 /// All kernels must have odd length (2*radius+1). Panics otherwise.
-pub fn convolve_separable(
+pub fn convolve_separable_with(
     grid: &SubpixelGrid,
     kernel_r: &[f32],
     kernel_g: &[f32],
     kernel_b: &[f32],
+    border: Border,
 ) -> SubpixelGrid {
     assert!(kernel_r.len() % 2 == 1, "kernel_r must have odd length");
     assert!(kernel_g.len() % 2 == 1, "kernel_g must have odd length");
@@ -109,9 +135,9 @@ pub fn convolve_separable(
 
     for row in 0..h {
         for col in 0..w {
-            let r = convolve1d_channel(grid, row, col, kernel_r, Channel::R, true);
-            let g = convolve1d_channel(grid, row, col, kernel_g, Channel::G, true);
-            let b = convolve1d_channel(grid, row, col, kernel_b, Channel::B, true);
+            let r = convolve1d_channel(grid, row, col, kernel_r, Channel::R, true, border);
+            let g = convolve1d_channel(grid, row, col, kernel_g, Channel::G, true, border);
+            let b = convolve1d_channel(grid, row, col, kernel_b, Channel::B, true, border);
             *horiz.pixel_mut(col, row) = SubpixelPixel { r, g, b };
         }
     }
@@ -121,9 +147,9 @@ pub fn convolve_separable(
 
     for row in 0..h {
         for col in 0..w {
-            let r = convolve1d_channel(&horiz, row, col, kernel_r, Channel::R, false);
-            let g = convolve1d_channel(&horiz, row, col, kernel_g, Channel::G, false);
-            let b = convolve1d_channel(&horiz, row, col, kernel_b, Channel::B, false);
+            let r = convolve1d_channel(&horiz, row, col, kernel_r, Channel::R, false, border);
+            let g = convolve1d_channel(&horiz, row, col, kernel_g, Channel::G, false, border);
+            let b = convolve1d_channel(&horiz, row, col, kernel_b, Channel::B, false, border);
             *vert.pixel_mut(col, row) = SubpixelPixel { r, g, b };
         }
     }
@@ -140,8 +166,6 @@ enum Channel { R, G, B }
 ///
 /// `horizontal = true`  → convolve along the row (vary col).
 /// `horizontal = false` → convolve along the column (vary row).
-///
-/// Border handling: clamp-to-edge (repeat the border pixel value).
 fn convolve1d_channel(
     grid: &SubpixelGrid,
     row: u32,
@@ -149,22 +173,30 @@ fn convolve1d_channel(
     kernel: &[f32],
     channel: Channel,
     horizontal: bool,
+    border: Border,
 ) -> f32 {
     let radius = (kernel.len() / 2) as i32;
-    let w = grid.width as i32;
-    let h = grid.height as i32;
+    let (pos, len) = if horizontal {
+        (col as i32, grid.width as i32)
+    } else {
+        (row as i32, grid.height as i32)
+    };
     let mut acc = 0.0f32;
 
     for (ki, &kv) in kernel.iter().enumerate() {
-        let offset = ki as i32 - radius;
+        let mut p = pos + ki as i32 - radius;
+        if p < 0 || p >= len {
+            match border {
+                Border::Zero => continue,
+                Border::Clamp => p = p.clamp(0, len - 1),
+            }
+        }
 
-        let (sc, sr) = if horizontal {
-            ((col as i32 + offset).clamp(0, w - 1) as u32, row)
+        let px = if horizontal {
+            grid.pixel(p as u32, row)
         } else {
-            (col, (row as i32 + offset).clamp(0, h - 1) as u32)
+            grid.pixel(col, p as u32)
         };
-
-        let px = grid.pixel(sc, sr);
         let v = match channel {
             Channel::R => px.r,
             Channel::G => px.g,
@@ -265,5 +297,46 @@ mod tests {
 
         assert!((sum_in - sum_out).abs() < 0.01,
             "energy not conserved: in={sum_in:.4} out={sum_out:.4}");
+    }
+
+    #[test]
+    fn zero_border_does_not_smear_edge_samples() {
+        // A lit sample on the left edge. Clamp repeats it outward, so the
+        // edge keeps far more light than it physically would; Zero lets the
+        // light that leaves the grid go.
+        let mut grid = SubpixelGrid::new(9, 1);
+        *grid.pixel_mut(0, 0) = SubpixelPixel { r: 1.0, g: 1.0, b: 1.0 };
+        let k = gaussian_kernel(1.5, 4);
+
+        let clamp = convolve_separable_with(&grid, &k, &k, &k, Border::Clamp);
+        let zero = convolve_separable_with(&grid, &k, &k, &k, Border::Zero);
+        assert!(clamp.pixel(0, 0).r > zero.pixel(0, 0).r * 1.5,
+            "clamp={} zero={}", clamp.pixel(0, 0).r, zero.pixel(0, 0).r);
+    }
+
+    #[test]
+    fn zero_border_matches_clamp_away_from_edges() {
+        let mut grid = SubpixelGrid::new(21, 21);
+        *grid.pixel_mut(10, 10) = SubpixelPixel { r: 1.0, g: 0.5, b: 0.25 };
+        let k = gaussian_kernel(1.0, 3);
+        let clamp = convolve_separable_with(&grid, &k, &k, &k, Border::Clamp);
+        let zero = convolve_separable_with(&grid, &k, &k, &k, Border::Zero);
+        for (col, row) in [(10u32, 10u32), (11, 10), (10, 12), (0, 0)] {
+            assert!((clamp.pixel(col, row).r - zero.pixel(col, row).r).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn zero_border_never_gains_energy() {
+        let grid = uniform_grid(8, 8, 1.0);
+        let k = gaussian_kernel(1.5, 4);
+        let out = convolve_separable_with(&grid, &k, &k, &k, Border::Zero);
+        for row in 0..8 {
+            for col in 0..8 {
+                assert!(out.pixel(col, row).g <= 1.0 + 1e-5);
+            }
+        }
+        // Interior is untouched, corners have lost light past two edges.
+        assert!(out.pixel(0, 0).g < 0.5);
     }
 }

@@ -40,8 +40,8 @@
 //! ## What is not yet simulated (Phase 3+)
 //!
 //! - Angular dependency of the PSF (wider at oblique angles)
-//! - Light spilling outside the glyph bitmap: the convolution clamps to the
-//!   edge instead of extending into the surrounding background
+//! - Light spilling outside the glyph bitmap: the simulated image has the
+//!   bitmap's extent, so blur that leaves it is dropped rather than shown
 //! - Measured, panel-specific apertures (the built-in geometries are nominal)
 //! - Temporal effects (OLED PWM dimming)
 //! - Human visual system MTF / contrast sensitivity function
@@ -57,7 +57,7 @@ pub use gamma::{
     viewing_distance_to_sigma, DEFAULT_PSF_FWHM_ARCMIN, LUMA_WEIGHTS,
 };
 pub use panel::{emit, integrate_pixels, Emitter, EmitterChannel, PanelGeometry};
-pub use psf::{convolve_separable, gaussian_kernel, kernel_radius};
+pub use psf::{convolve_separable, convolve_separable_with, gaussian_kernel, kernel_radius, Border};
 
 use crate::profile::DisplayProfile;
 use crate::subpixel::SubpixelGrid;
@@ -179,8 +179,10 @@ pub const DEFAULT_OVERSAMPLE: u32 = 6;
 /// With `params.sigma <= 0.0` the bare emission map is returned — a view of
 /// the subpixel structure with no optical blur.
 ///
-/// The result is in linear light and luminance-preserving: its spatial mean
-/// equals that of the input, so individual samples can exceed 1.0. Use
+/// The result is in linear light and luminance-preserving: away from the
+/// bitmap edges its spatial mean equals that of the input, so individual
+/// samples can exceed 1.0. The surroundings are treated as black, and blur
+/// that leaves the bitmap is dropped. Use
 /// [`integrate_pixels`] with the same `oversample` to return to one value per
 /// logical pixel.
 pub fn simulate_panel(
@@ -200,7 +202,8 @@ pub fn simulate_panel(
     }
 
     let (kr, kg, kb) = params.bleed.kernels(params.sigma * oversample as f32);
-    convolve_separable(&emission, &kr, &kg, &kb)
+    // Outside the glyph bitmap is dark background, not more of the edge sample.
+    convolve_separable_with(&emission, &kr, &kg, &kb, Border::Zero)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

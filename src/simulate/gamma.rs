@@ -158,6 +158,9 @@ pub fn check_linear(grid: &SubpixelGrid, label: &str) -> bool {
 
     let ok = max_val <= 1.0 + 1e-4 && !any_negative;
 
+    // The warning below is compiled out of release builds.
+    let _ = label;
+
     #[cfg(debug_assertions)]
     if !ok {
         eprintln!(
