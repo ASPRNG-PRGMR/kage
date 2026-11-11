@@ -593,3 +593,29 @@ The inspector showed three unlabelled images with coloured bars. Someone opening
 
 105 unit tests pass. Both views were captured with `--snapshot` and checked. Scroll direction, drag and the key toggles were not exercised by hand.
 
+---
+
+## Session 13 — Title bar, readability
+**Date:** 2026-11-11
+
+### Title bar / maximise
+
+The window had no title bar on GNOME Wayland, so it could not be maximised or moved. minifb's Wayland backend asks for server-side decorations, GNOME does not provide them, and minifb draws none itself. It also has no maximise or fullscreen call.
+
+Fix: when both `WAYLAND_DISPLAY` and `DISPLAY` are set, the inspector hides `WAYLAND_DISPLAY` while creating the window, so minifb falls through to its X11 backend and the window manager decorates the window as usual. If X11 creation fails it restores the variable and retries on Wayland. `KAGE_BACKEND=wayland` keeps the native backend.
+
+Consequences handled:
+- **Scroll sign differs by backend** (X11: positive = up; Wayland: positive = down). The inspector records which backend it got and maps "scroll up" to zoom in on both.
+- **Minimum-size clamp** (Session 9) is a workaround for spurious Wayland configure sizes. It now applies only on native Wayland; on X11 the interface follows the real window size down to 480×360.
+
+Verified: the X11 window reports a 37 px top frame extent (`_NET_FRAME_EXTENTS`), i.e. it has a title bar. Clicking maximise was not tested by hand.
+
+### Readability
+
+- Text sizes raised across the board (body 13 → 16 px, panel titles 17 → 21 px, hints 12 → 14 px) and the three text colours brightened; running text no longer uses the dim colour.
+- An interface scale (`Ui`) multiplies every length and text size: 1.0 up to a 900 px tall window, rising to 1.5 in steps of 1/8, so a maximised window on a large display gets proportionally larger text.
+- The header sentence and panel descriptions wrap to two lines (`wrap_text`) and end in an ellipsis if they still do not fit, instead of being cut off mid-word.
+- Panel descriptions rewritten as plain sentences; chips and key hints use sentence case and are larger.
+
+110 unit tests pass.
+

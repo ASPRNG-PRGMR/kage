@@ -144,7 +144,9 @@ The CLI also prints two numbers per rendering mode: **luminance error** (RMS dif
 | `H` | Toggle per-channel heatmap overlay |
 | `Esc` | Quit |
 
-The window explains itself: a header says what is on screen and which view is active, each panel has a title and a one-line description of its rendering strategy, and the footer lists the controls. The glyph opens fitted to the panel and stays fitted until you zoom or pan. At zoom ≥ 8× faint lines mark pixel boundaries. The heatmap mode (`H`) false-colours the image to make R/B channel imbalance visible — useful for measuring fringing. In the simulated view each panel's heading also shows its luminance error and colour fringing.
+The window has a normal title bar, so it can be maximised, tiled or closed like any other. On Wayland desktops KAGE opens through XWayland to get one, because the windowing library draws no title bar of its own on compositors such as GNOME; set `KAGE_BACKEND=wayland` to use the native backend instead.
+
+The window explains itself: a header says what is on screen and which view is active, each panel has a title and a one-line description of its rendering strategy, and the footer lists the controls. Interface text scales up with the window, and long lines wrap rather than run off the edge. The glyph opens fitted to the panel and stays fitted until you zoom or pan — including when the window is maximised. At zoom ≥ 8× faint lines mark pixel boundaries. The heatmap mode (`H`) false-colours the image to make R/B channel imbalance visible — useful for measuring fringing. In the simulated view each panel's heading also shows its luminance error and colour fringing.
 
 In the simulated view each logical pixel is drawn from its individual emitters, so zooming in shows the real subpixel structure. The simulated image is luminance-preserving, which makes bare emitters brighter than 1.0; auto-exposure (on by default) scales all three panels by one common factor so they stay comparable, and `E` switches to clipping instead.
 

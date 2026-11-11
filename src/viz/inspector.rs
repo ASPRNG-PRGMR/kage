@@ -44,26 +44,39 @@ const FALLBACK_WIN_W: usize = 1280;
 /// Fallback window height.
 const FALLBACK_WIN_H: usize = 800;
 
-// Layout, in host pixels.
-const HEADER_H: usize = 72;
-const FOOTER_H: usize = 38;
-const MARGIN: usize = 14;
-const GAP: usize = 12;
-const CARD_HEAD_H: usize = 62;
-const PAD: i32 = 14;
+// Layout, in host pixels at interface scale 1.0 (see `Ui`).
+const HEADER_H: i32 = 112;
+const FOOTER_H: i32 = 48;
+const MARGIN: i32 = 16;
+const GAP: i32 = 14;
+const CARD_HEAD_H: i32 = 96;
+const PAD: i32 = 16;
+
+// Text sizes, in pixels at interface scale 1.0.
+const SIZE_TITLE: i32 = 30;
+const SIZE_TAGLINE: i32 = 17;
+const SIZE_BODY: i32 = 16;
+const SIZE_CARD_TITLE: i32 = 21;
+const SIZE_CARD_BODY: i32 = 15;
+const SIZE_SMALL: i32 = 14;
 
 // Palette.
 const BG: u32 = 0xFF_0F_11_15;
-const HEADER_BG: u32 = 0xFF_15_18_21;
-const CARD_BG: u32 = 0xFF_17_1A_22;
+const HEADER_BG: u32 = 0xFF_16_19_22;
+const CARD_BG: u32 = 0xFF_18_1B_24;
 const VIEW_BG: u32 = 0xFF_08_09_0C;
-const BORDER: u32 = 0xFF_26_2B_36;
+const BORDER: u32 = 0xFF_2B_31_3D;
 const GLYPH_OUTLINE: u32 = 0xFF_2E_34_42;
-const TEXT: u32 = 0xFF_E6_E9_EF;
-const TEXT_DIM: u32 = 0xFF_8B_93_A3;
-const CHIP_BG: u32 = 0xFF_22_27_33;
-const CHIP_ON_BG: u32 = 0xFF_2A_42_6B;
-const CHIP_ON_TEXT: u32 = 0xFF_D6_E6_FF;
+/// Headings and anything that must stand out.
+const TEXT: u32 = 0xFF_F4_F6_FA;
+/// Running text.
+const TEXT_BODY: u32 = 0xFF_CD_D3_DE;
+/// Labels and secondary detail.
+const TEXT_DIM: u32 = 0xFF_A3_AB_BA;
+const CHIP_BG: u32 = 0xFF_27_2D_3A;
+const CHIP_ON_BG: u32 = 0xFF_2F_55_91;
+const CHIP_ON_TEXT: u32 = 0xFF_FF_FF_FF;
+const KEY_BG: u32 = 0xFF_33_3A_49;
 
 const ZOOM_MIN: f32 = 1.0;
 const ZOOM_MAX: f32 = 64.0;
@@ -74,17 +87,17 @@ const PANELS: [(&str, u32, &str); 3] = [
     (
         "Greyscale AA",
         0xFF_4A_90_D9,
-        "Baseline: every subpixel gets the same coverage. No colour fringes, softest edges.",
+        "The baseline. Every subpixel gets the same value: no colour fringes, but the softest edges.",
     ),
     (
         "Subpixel AA",
         0xFF_E8_7B_3A,
-        "ClearType-style: each colour channel filtered separately. Sharper, but fringes.",
+        "ClearType-style. Each colour channel is filtered separately: sharper, but edges pick up colour.",
     ),
     (
         "OLED-Aware",
         0xFF_5A_C9_5A,
-        "Filter matched to the panel's subpixel layout; fringes suppressed at hard edges.",
+        "KAGE's approach. The filter follows the panel's real subpixel layout and tones down fringes at hard edges.",
     ),
 ];
 
@@ -285,8 +298,33 @@ struct Card {
     view: Rect,
 }
 
+/// Interface scale: every layout length and text size is multiplied by it,
+/// so the interface stays readable when the window is large.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Ui(f32);
+
+impl Ui {
+    /// Scale for a window `win_h` pixels tall: 1.0 up to 900 px, growing to
+    /// 1.5 for tall windows, in steps of 1/8 so only a few text sizes are
+    /// ever rasterized.
+    fn for_window(win_h: usize) -> Self {
+        let raw = (win_h as f32 / 900.0).clamp(1.0, 1.5);
+        Ui((raw * 8.0).floor() / 8.0)
+    }
+
+    /// Scale a length.
+    fn len(self, v: i32) -> i32 {
+        (v as f32 * self.0).round() as i32
+    }
+
+    /// Scale a text size.
+    fn px(self, v: i32) -> u32 {
+        self.len(v).max(1) as u32
+    }
+}
+
 /// Lay out the cards for a window of `win_w` × `win_h`.
-fn layout_cards(win_w: usize, win_h: usize, mode: DisplayMode) -> Vec<Card> {
+fn layout_cards(win_w: usize, win_h: usize, mode: DisplayMode, ui: Ui) -> Vec<Card> {
     let indices: &[usize] = match mode {
         DisplayMode::Greyscale => &[0],
         DisplayMode::SubpixelAa => &[1],
@@ -294,10 +332,11 @@ fn layout_cards(win_w: usize, win_h: usize, mode: DisplayMode) -> Vec<Card> {
         DisplayMode::SideBySide => &[0, 1, 2],
     };
     let n = indices.len() as i32;
-    let top = (HEADER_H + MARGIN) as i32;
-    let bottom = win_h as i32 - (FOOTER_H + MARGIN) as i32;
-    let region_w = win_w as i32 - 2 * MARGIN as i32;
-    let card_w = ((region_w - GAP as i32 * (n - 1)) / n).max(0);
+    let (margin, gap, head) = (ui.len(MARGIN), ui.len(GAP), ui.len(CARD_HEAD_H));
+    let top = ui.len(HEADER_H) + margin;
+    let bottom = win_h as i32 - ui.len(FOOTER_H) - margin;
+    let region_w = win_w as i32 - 2 * margin;
+    let card_w = ((region_w - gap * (n - 1)) / n).max(0);
     let card_h = (bottom - top).max(0);
 
     indices
@@ -305,20 +344,67 @@ fn layout_cards(win_w: usize, win_h: usize, mode: DisplayMode) -> Vec<Card> {
         .enumerate()
         .map(|(slot, &index)| {
             let outer = Rect {
-                x: MARGIN as i32 + slot as i32 * (card_w + GAP as i32),
+                x: margin + slot as i32 * (card_w + gap),
                 y: top,
                 w: card_w,
                 h: card_h,
             };
             let view = Rect {
                 x: outer.x + 1,
-                y: outer.y + CARD_HEAD_H as i32,
+                y: outer.y + head,
                 w: (outer.w - 2).max(0),
-                h: (outer.h - CARD_HEAD_H as i32 - 1).max(0),
+                h: (outer.h - head - 1).max(0),
             };
             Card { index, outer, view }
         })
         .collect()
+}
+
+/// Break `text` into at most `max_lines` lines no wider than `max_w`,
+/// measuring with `width`. Text that does not fit ends in an ellipsis.
+fn wrap_text(text: &str, max_w: i32, max_lines: usize, mut width: impl FnMut(&str) -> i32) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut words = text.split_whitespace().peekable();
+
+    while let Some(word) = words.next() {
+        let candidate = if current.is_empty() { word.to_owned() } else { format!("{current} {word}") };
+        if current.is_empty() || width(&candidate) <= max_w {
+            current = candidate;
+        } else if lines.len() + 1 < max_lines {
+            lines.push(std::mem::replace(&mut current, word.to_owned()));
+        } else {
+            // Out of lines: drop words until the ellipsis fits.
+            let mut cut = current;
+            while !cut.is_empty() && width(&format!("{cut}…")) > max_w {
+                match cut.rfind(' ') {
+                    Some(i) => cut.truncate(i),
+                    None => cut.clear(),
+                }
+            }
+            lines.push(format!("{cut}…"));
+            return lines;
+        }
+        if words.peek().is_none() {
+            break;
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Whether to open the window through X11 rather than native Wayland.
+///
+/// minifb's Wayland backend gives no title bar on compositors without
+/// server-side decorations (GNOME), so the window cannot be maximised or
+/// moved with the mouse. Through XWayland the window manager supplies the
+/// usual title bar. Set `KAGE_BACKEND=wayland` to keep the native backend.
+fn prefer_x11() -> bool {
+    let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+    let forced_wayland = std::env::var("KAGE_BACKEND").is_ok_and(|v| v.eq_ignore_ascii_case("wayland"));
+    set("WAYLAND_DISPLAY") && set("DISPLAY") && !forced_wayland
 }
 
 // ── Inspector ─────────────────────────────────────────────────────────────────
@@ -360,9 +446,14 @@ pub struct Inspector {
     fb: Vec<u32>,
     win_w: usize,
     win_h: usize,
-    /// Hard minimum — the size we opened at.
+    /// Smallest size the interface is drawn at. On native Wayland this is
+    /// the size the window opened at, because the compositor reports
+    /// spurious smaller sizes; elsewhere it is a small fixed floor.
     min_win_w: usize,
     min_win_h: usize,
+    /// True when running on native Wayland, where a positive scroll value
+    /// means "down"; on X11 it means "up".
+    wayland: bool,
 
     /// Renderer output, linear light.
     raw: ViewSet,
@@ -418,16 +509,32 @@ impl Inspector {
         let win_w = ((screen_w as f64 * SCREEN_FRACTION) as usize).max(640);
         let win_h = ((screen_h as f64 * SCREEN_FRACTION) as usize).max(400);
 
-        let mut win = Window::new(
-            &config.window_title,
-            win_w,
-            win_h,
-            WindowOptions {
-                resize: true,
-                ..Default::default()
-            },
-        )?;
+        let options = || WindowOptions { resize: true, ..Default::default() };
+
+        // Prefer X11 (XWayland) so the window gets a title bar with
+        // maximise / close buttons; fall back to native Wayland if that fails.
+        let wayland_display = std::env::var_os("WAYLAND_DISPLAY");
+        let mut wayland = wayland_display.as_ref().is_some_and(|v| !v.is_empty());
+        let mut win = if prefer_x11() {
+            std::env::remove_var("WAYLAND_DISPLAY");
+            match Window::new(&config.window_title, win_w, win_h, options()) {
+                Ok(win) => {
+                    wayland = false;
+                    win
+                }
+                Err(_) => {
+                    if let Some(value) = &wayland_display {
+                        std::env::set_var("WAYLAND_DISPLAY", value);
+                    }
+                    Window::new(&config.window_title, win_w, win_h, options())?
+                }
+            }
+        } else {
+            Window::new(&config.window_title, win_w, win_h, options())?
+        };
         win.set_target_fps(60);
+
+        let (min_win_w, min_win_h) = if wayland { (win_w, win_h) } else { (480, 360) };
 
         let text = config.ui_font.as_deref().and_then(TextRenderer::new);
 
@@ -438,8 +545,9 @@ impl Inspector {
             fb: vec![BG; win_w * win_h],
             win_w,
             win_h,
-            min_win_w: win_w,
-            min_win_h: win_h,
+            min_win_w,
+            min_win_h,
+            wayland,
             raw,
             simulated,
             profile,
@@ -473,7 +581,7 @@ impl Inspector {
 
     /// Process input events and redraw if anything changed.
     pub fn update(&mut self) -> Result<(), minifb::Error> {
-        // Clamp to minimum size — prevents Wayland Configure shrinking.
+        // Follow the window size, down to the minimum (see `min_win_w`).
         let (new_w, new_h) = self.window.get_size();
         self.win_w = new_w.max(self.min_win_w);
         self.win_h = new_h.max(self.min_win_h);
@@ -530,8 +638,12 @@ impl Inspector {
         }
     }
 
+    fn ui(&self) -> Ui {
+        Ui::for_window(self.win_h)
+    }
+
     fn cards(&self) -> Vec<Card> {
-        layout_cards(self.win_w, self.win_h, self.display_mode)
+        layout_cards(self.win_w, self.win_h, self.display_mode, self.ui())
     }
 
     /// Whether the simulated image is what is currently on screen.
@@ -608,7 +720,8 @@ impl Inspector {
         // ── Scroll-wheel zoom, anchored to the cursor ──────────────────────
         //
         // Which axis carries vertical scroll differs between backends, so the
-        // axis with the larger magnitude is used. A positive value zooms out.
+        // axis with the larger magnitude is used. Scrolling up zooms in: that
+        // is a positive value on X11 and a negative one on Wayland.
         if let Some((scroll_x, scroll_y)) = self.window.get_scroll_wheel() {
             let raw = if scroll_x.abs() >= scroll_y.abs() { scroll_x } else { scroll_y };
             if raw.abs() > 0.05 {
@@ -632,7 +745,8 @@ impl Inspector {
                     None => (0.0, 0.0),
                 };
 
-                let factor = if raw > 0.0 { 1.0 / ZOOM_STEP } else { ZOOM_STEP };
+                let zoom_in = (raw > 0.0) != self.wayland;
+                let factor = if zoom_in { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
                 self.zoom_about(factor, rel_x, rel_y);
             }
         }
@@ -745,14 +859,35 @@ impl Inspector {
         self.text.as_mut().map_or(0, |t| t.width(px, s))
     }
 
+    /// Draw `text` wrapped to `max_lines` lines within `left..right`,
+    /// starting at `y`. Returns the y-coordinate below the last line.
+    #[allow(clippy::too_many_arguments)]
+    fn paragraph(&mut self, left: i32, right: i32, y: i32, px: u32, color: u32, max_lines: usize, s: &str) -> i32 {
+        let line_h = (px as f32 * 1.45).round() as i32;
+        let lines = match self.text.as_mut() {
+            Some(t) => wrap_text(s, right - left, max_lines, |line| t.width(px, line)),
+            None => return y,
+        };
+        let mut line_y = y;
+        for line in &lines {
+            self.text(left, line_y, px, color, right, line);
+            line_y += line_h;
+        }
+        line_y
+    }
+
     /// Draw a small labelled box whose right edge is at `right`.
     /// Returns the x-coordinate of its left edge.
     fn chip_right(&mut self, right: i32, y: i32, label: &str, on: bool) -> i32 {
-        let w = self.text_width(12, label) + 16;
+        let ui = self.ui();
+        let px = ui.px(SIZE_SMALL);
+        let pad = ui.len(11);
+        let w = self.text_width(px, label) + 2 * pad;
+        let h = ui.len(28);
         let x = right - w;
-        let (bg, fg) = if on { (CHIP_ON_BG, CHIP_ON_TEXT) } else { (CHIP_BG, TEXT_DIM) };
-        self.fill_rect(Rect { x, y, w, h: 22 }, bg);
-        self.text(x + 8, y + 4, 12, fg, right, label);
+        let (bg, fg) = if on { (CHIP_ON_BG, CHIP_ON_TEXT) } else { (CHIP_BG, TEXT_BODY) };
+        self.fill_rect(Rect { x, y, w, h }, bg);
+        self.text(x + pad, y + (h - px as i32) / 2 - ui.len(2), px, fg, right, label);
         x
     }
 
@@ -767,92 +902,108 @@ impl Inspector {
         self.draw_footer();
     }
 
-    /// Title, a sentence saying what is on screen, and the current view state.
+    /// Title, the current view state, and a sentence saying what is on screen.
     fn draw_header(&mut self) {
+        let ui = self.ui();
         let w = self.win_w as i32;
-        self.fill_rect(Rect { x: 0, y: 0, w, h: HEADER_H as i32 }, HEADER_BG);
-        self.fill_rect(Rect { x: 0, y: HEADER_H as i32 - 1, w, h: 1 }, BORDER);
+        let header_h = ui.len(HEADER_H);
+        self.fill_rect(Rect { x: 0, y: 0, w, h: header_h }, HEADER_BG);
+        self.fill_rect(Rect { x: 0, y: header_h - 1, w, h: 1 }, BORDER);
 
-        let left = MARGIN as i32 + 2;
-        let right = w - MARGIN as i32 - 2;
+        let left = ui.len(MARGIN) + 2;
+        let right = w - ui.len(MARGIN) - 2;
 
-        // Line 1, right: what is being rendered.
-        let subject = self.config.subject.clone();
-        let subject_x = (right - self.text_width(13, &subject)).max(left);
-        self.text(subject_x, 16, 13, TEXT_DIM, right, &subject);
-
-        // Line 1, left: name and tagline.
-        let x = self.text(left, 9, 24, TEXT, subject_x - 16, "KAGE");
-        self.text(x + 12, 17, 14, TEXT_DIM, subject_x - 16, "OLED-aware subpixel text rendering inspector");
-
-        // Line 2, right: view state.
-        let chip_y = 40;
+        // Row 1, right: view state.
+        let chip_y = ui.len(14);
+        let gap = ui.len(8);
         let simulated = self.showing_simulation();
-        let zoom_label = format!("zoom {:.1}×", self.zoom);
+        let zoom_label = format!("Zoom {:.1}×", self.zoom);
         let mut cx = self.chip_right(right, chip_y, &zoom_label, false);
         if self.heatmap {
-            cx = self.chip_right(cx - 6, chip_y, "HEATMAP", true);
+            cx = self.chip_right(cx - gap, chip_y, "Heatmap", true);
         }
         if self.luminance {
-            cx = self.chip_right(cx - 6, chip_y, "LUMINANCE", true);
+            cx = self.chip_right(cx - gap, chip_y, "Luminance only", true);
         }
         if simulated && !self.auto_exposure {
-            cx = self.chip_right(cx - 6, chip_y, "CLIPPED", true);
+            cx = self.chip_right(cx - gap, chip_y, "Clipped", true);
         }
         cx = if simulated {
-            self.chip_right(cx - 6, chip_y, "SIMULATED PANEL", true)
+            self.chip_right(cx - gap, chip_y, "View: simulated panel", true)
         } else {
-            self.chip_right(cx - 6, chip_y, "RAW RENDER", false)
+            self.chip_right(cx - gap, chip_y, "View: raw render", false)
         };
 
-        // Line 2, left: what the viewer is looking at.
+        // Row 1, left: name and tagline.
+        let clip = cx - ui.len(16);
+        let x = self.text(left, ui.len(8), ui.px(SIZE_TITLE), TEXT, clip, "KAGE");
+        self.text(
+            x + ui.len(14),
+            ui.len(19),
+            ui.px(SIZE_TAGLINE),
+            TEXT_DIM,
+            clip,
+            "OLED-aware subpixel text rendering inspector",
+        );
+
+        // Rows 2–3, right: what is being rendered.
+        let body = ui.px(SIZE_BODY);
+        let row2 = ui.len(54);
+        let subject = self.config.subject.clone();
+        let subject_x = (right - self.text_width(body, &subject)).max(left);
+        self.text(subject_x, row2, body, TEXT_DIM, right, &subject);
+
+        // Rows 2–3, left: what the viewer is looking at.
         let layout = &self.config.layout_name;
         let line = if simulated {
             let note = self.config.simulation_note.as_deref().unwrap_or("");
             format!(
-                "The same glyph as a {layout} panel would emit it: every subpixel drawn where it physically sits. {note}"
+                "How a {layout} panel would actually show each version: every subpixel is drawn where it physically sits. {note}"
             )
         } else if self.simulated.is_some() {
             format!(
-                "One glyph, antialiased three ways for a {layout} display. Shown: the renderer's output, one RGB value per pixel. Press S to see it on the physical panel."
+                "One glyph, antialiased three ways for a {layout} display. You are looking at the renderer's output: one RGB value per pixel. Press S to see how the physical panel would show it."
             )
         } else {
             format!(
-                "One glyph, antialiased three ways for a {layout} display. Shown: the renderer's output, one RGB value per pixel."
+                "One glyph, antialiased three ways for a {layout} display. You are looking at the renderer's output: one RGB value per pixel."
             )
         };
-        self.text(left, 44, 13, TEXT, cx - 16, &line);
+        self.paragraph(left, subject_x - ui.len(32), row2, body, TEXT_BODY, 2, &line);
     }
 
-    /// One panel: accent bar, title, description, metrics, viewport.
+    /// One panel: accent bar, title, metrics, description, viewport.
     fn draw_card(&mut self, card: Card) {
+        let ui = self.ui();
         let (name, accent, description) = PANELS[card.index];
         let o = card.outer;
 
         self.fill_rect(o, BORDER);
         self.fill_rect(Rect { x: o.x + 1, y: o.y + 1, w: o.w - 2, h: o.h - 2 }, CARD_BG);
-        self.fill_rect(Rect { x: o.x, y: o.y, w: o.w, h: 3 }, accent);
+        self.fill_rect(Rect { x: o.x, y: o.y, w: o.w, h: ui.len(4) }, accent);
 
-        let left = o.x + PAD;
-        let right = o.right() - PAD;
-        let name_end = self.text(left, o.y + 13, 17, TEXT, right, name);
+        let left = o.x + ui.len(PAD);
+        let right = o.right() - ui.len(PAD);
+        let title_px = ui.px(SIZE_CARD_TITLE);
+        let name_end = self.text(left, o.y + ui.len(13), title_px, TEXT, right, name);
 
         // Metrics, right-aligned on the title line, when they fit.
         if self.showing_simulation() {
             if let Some(metrics) = self.config.metrics {
                 let m = metrics[card.index];
+                let small = ui.px(SIZE_SMALL);
                 let label = format!(
-                    "luminance error {:.3}   colour fringing {:.3}",
+                    "Luminance error {:.3}    Colour fringing {:.3}",
                     m.luminance_error, m.chroma
                 );
-                let x = right - self.text_width(12, &label);
-                if x > name_end + 16 {
-                    self.text(x, o.y + 17, 12, TEXT_DIM, right, &label);
+                let x = right - self.text_width(small, &label);
+                if x > name_end + ui.len(16) {
+                    self.text(x, o.y + ui.len(19), small, TEXT_DIM, right, &label);
                 }
             }
         }
 
-        self.text(left, o.y + 38, 12, TEXT_DIM, right, description);
+        self.paragraph(left, right, o.y + ui.len(46), ui.px(SIZE_CARD_BODY), TEXT_BODY, 2, description);
         self.fill_rect(Rect { x: o.x + 1, y: card.view.y - 1, w: o.w - 2, h: 1 }, BORDER);
 
         self.draw_view(card);
@@ -948,37 +1099,43 @@ impl Inspector {
 
     /// Key hints along the bottom edge.
     fn draw_footer(&mut self) {
+        let ui = self.ui();
         let w = self.win_w as i32;
-        let top = self.win_h as i32 - FOOTER_H as i32;
-        self.fill_rect(Rect { x: 0, y: top, w, h: FOOTER_H as i32 }, HEADER_BG);
+        let footer_h = ui.len(FOOTER_H);
+        let top = self.win_h as i32 - footer_h;
+        self.fill_rect(Rect { x: 0, y: top, w, h: footer_h }, HEADER_BG);
         self.fill_rect(Rect { x: 0, y: top, w, h: 1 }, BORDER);
 
-        let simulate_hint = if self.simulated.is_some() { "simulated panel" } else { "simulation off" };
+        let simulate_hint = if self.simulated.is_some() { "Simulated panel" } else { "Simulation off" };
         let hints = [
-            ("Scroll", "zoom"),
-            ("Drag", "pan"),
-            ("R", "reset"),
-            ("1 2 3", "one panel"),
-            ("A", "all"),
+            ("Scroll", "Zoom"),
+            ("Drag", "Pan"),
+            ("R", "Reset view"),
+            ("1  2  3", "One panel"),
+            ("A", "All panels"),
             ("S", simulate_hint),
-            ("L", "luminance"),
-            ("E", "exposure"),
-            ("H", "heatmap"),
-            ("Esc", "quit"),
+            ("L", "Luminance"),
+            ("E", "Exposure"),
+            ("H", "Heatmap"),
+            ("Esc", "Quit"),
         ];
 
-        let right = w - MARGIN as i32;
-        let mut x = MARGIN as i32;
-        let y = top + 9;
+        let px = ui.px(SIZE_SMALL);
+        let key_h = ui.len(26);
+        let key_pad = ui.len(9);
+        let right = w - ui.len(MARGIN);
+        let y = top + (footer_h - key_h) / 2;
+        let text_y = y + (key_h - px as i32) / 2 - ui.len(2);
+        let mut x = ui.len(MARGIN);
         for (key, label) in hints {
-            let key_w = self.text_width(12, key) + 12;
-            let label_w = self.text_width(12, label);
-            if x + key_w + 6 + label_w > right {
+            let key_w = self.text_width(px, key) + 2 * key_pad;
+            let label_w = self.text_width(px, label);
+            if x + key_w + ui.len(8) + label_w > right {
                 break;
             }
-            self.fill_rect(Rect { x, y, w: key_w, h: 20 }, CHIP_BG);
-            self.text(x + 6, y + 3, 12, TEXT, right, key);
-            x = self.text(x + key_w + 6, y + 3, 12, TEXT_DIM, right, label) + 18;
+            self.fill_rect(Rect { x, y, w: key_w, h: key_h }, KEY_BG);
+            self.text(x + key_pad, text_y, px, TEXT, right, key);
+            x = self.text(x + key_w + ui.len(8), text_y, px, TEXT_BODY, right, label) + ui.len(22);
         }
     }
 }
@@ -1068,30 +1225,30 @@ mod tests {
 
     #[test]
     fn side_by_side_lays_out_three_equal_cards_inside_the_window() {
-        let cards = layout_cards(1280, 800, DisplayMode::SideBySide);
+        let cards = layout_cards(1280, 800, DisplayMode::SideBySide, Ui(1.0));
         assert_eq!(cards.len(), 3);
         assert_eq!(cards.iter().map(|c| c.index).collect::<Vec<_>>(), vec![0, 1, 2]);
         for pair in cards.windows(2) {
             assert_eq!(pair[0].outer.w, pair[1].outer.w);
-            assert_eq!(pair[1].outer.x - pair[0].outer.right(), GAP as i32);
+            assert_eq!(pair[1].outer.x - pair[0].outer.right(), GAP);
         }
         let last = cards[2];
-        assert!(last.outer.right() <= 1280 - MARGIN as i32);
-        assert!(last.outer.y + last.outer.h <= 800 - FOOTER_H as i32);
-        assert!(last.view.y >= last.outer.y + CARD_HEAD_H as i32);
+        assert!(last.outer.right() <= 1280 - MARGIN);
+        assert!(last.outer.y + last.outer.h <= 800 - FOOTER_H);
+        assert!(last.view.y >= last.outer.y + CARD_HEAD_H);
     }
 
     #[test]
     fn single_mode_shows_the_selected_panel_full_width() {
-        let cards = layout_cards(1280, 800, DisplayMode::OledAware);
+        let cards = layout_cards(1280, 800, DisplayMode::OledAware, Ui(1.0));
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].index, 2);
-        assert_eq!(cards[0].outer.w, 1280 - 2 * MARGIN as i32);
+        assert_eq!(cards[0].outer.w, 1280 - 2 * MARGIN);
     }
 
     #[test]
     fn layout_survives_a_tiny_window() {
-        for card in layout_cards(10, 10, DisplayMode::SideBySide) {
+        for card in layout_cards(10, 10, DisplayMode::SideBySide, Ui(1.5)) {
             assert!(card.outer.w >= 0 && card.outer.h >= 0);
             assert!(card.view.w >= 0 && card.view.h >= 0);
         }
@@ -1116,5 +1273,45 @@ mod tests {
     #[test]
     fn pack_rgb_clamps() {
         assert_eq!(pack_rgb(2.0, -1.0, 0.5), 0xFF_FF_00_80);
+    }
+
+    #[test]
+    fn ui_scale_grows_with_window_height_in_steps() {
+        assert_eq!(Ui::for_window(600), Ui(1.0));
+        assert_eq!(Ui::for_window(900), Ui(1.0));
+        assert_eq!(Ui::for_window(1200), Ui(1.25));
+        assert_eq!(Ui::for_window(4000), Ui(1.5));
+        assert_eq!(Ui(1.25).len(16), 20);
+        assert_eq!(Ui(1.0).px(0), 1);
+    }
+
+    /// Eight pixels per character: enough to test the wrapping logic.
+    fn mono(s: &str) -> i32 {
+        s.chars().count() as i32 * 8
+    }
+
+    #[test]
+    fn wrap_keeps_short_text_on_one_line() {
+        assert_eq!(wrap_text("hello world", 200, 2, mono), vec!["hello world"]);
+    }
+
+    #[test]
+    fn wrap_breaks_between_words() {
+        // 80 px = 10 characters per line.
+        assert_eq!(wrap_text("aaaa bbbb cccc", 80, 3, mono), vec!["aaaa bbbb", "cccc"]);
+    }
+
+    #[test]
+    fn wrap_ends_with_an_ellipsis_when_out_of_lines() {
+        let lines = wrap_text("aaaa bbbb cccc dddd eeee", 80, 2, mono);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "aaaa bbbb");
+        assert!(lines[1].ends_with('…'), "{lines:?}");
+        assert!(mono(&lines[1]) <= 80, "{lines:?}");
+    }
+
+    #[test]
+    fn wrap_handles_empty_text() {
+        assert!(wrap_text("", 100, 2, mono).is_empty());
     }
 }
