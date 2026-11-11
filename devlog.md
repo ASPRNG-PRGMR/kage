@@ -684,3 +684,43 @@ A grid search over luma footprint 0.4–1.2, chroma footprint 0.5–2.5 and edge
 ### Phase 4
 
 Not started on `main`. `phase4.md` specifies it. The two GPU backends were prototyped and verified against the CPU renderers before the phase was put on hold; they are on the branch `phase4-gpu-backends`.
+
+## Session 15 — Phase 4: GPU backends and live tuning (2026-11-11)
+
+### Implementation
+
+Built on the two commits from `phase4-gpu-backends`, reviewing the shared shader arithmetic and resource lifecycle. OpenGL uses a float framebuffer in an off-screen EGL context; Vulkan compiles the shared GLSL with naga and dispatches compute work over mapped buffers. Added cleanup for partial OpenGL initialisation and stopped Vulkan reuse after a failed submission. GPU features remain optional and initialisation failures are cached.
+
+`Pipeline::run` now renders all three modes on the selected backend, excludes backend creation from its timer, and recomputes the complete run on CPU after a GPU error. Output records the actual backend, device, elapsed rendering time and optional error. Baseline simulation caches remain based on CPU grids; GPU rounding is immaterial to their metrics. Auto-tuning remains on CPU.
+
+The inspector attaches the pipeline and offers four adjustable settings, Tab / Shift+Tab selection, repeating bracket adjustments, T auto-tune, B backend cycling and Backspace reset to starting settings (including backend). A revision counter triggers redraw after changes. The tuning bar shows values, backend, render time and fallback errors. Snapshot mode now uses the same drawing code without opening a window, at a deterministic 1280×800. Both README screenshots were regenerated and visually inspected.
+
+The Phase 4 specification was deleted before the first implementation commit, as requested.
+
+### Measurements
+
+Machine: AMD Ryzen AI 7 350 with Radeon 860M host CPU; accessible GPU drivers were **llvmpipe (LLVM 23.1.2, 256 bits)**, OpenGL 4.6 / Vulkan 1.4. These are software-driver timings, not measurements of the Radeon hardware. Release build, DejaVu Sans `A` at 64 px, Pentile RGBG, 109 DPI, 500 mm, 4× coverage supersampling, 6× simulation. The harness warms each pipeline, averages 20 alternating footprint updates and 10 alternating viewing-distance updates. Times vary with system load.
+
+| Backend | Three-mode render | Footprint update, including simulation and metrics | Distance update, including cache rebuild |
+|---------|------------------|--------------------------------------------------|-----------------------------------------|
+| CPU | 0.416 ms | 6.056 ms | 20.157 ms |
+| OpenGL / llvmpipe | 0.731 ms | 6.483 ms | 21.586 ms |
+| Vulkan / llvmpipe | 0.259 ms | 5.648 ms | 19.864 ms |
+
+Reproduce with `cargo run --release --example pipeline_timing -- /usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf`. An optional second argument sets simulation scale. These update timings exclude inspector encoding and framebuffer drawing. Backend creation is excluded; first draws can still contain deferred driver compilation.
+
+At 8× simulation, the initial CPU footprint / distance update took 16.238 / 57.772 ms. Moving PSF convolution to contiguous per-channel rows reduced those to 13.106 / 49.638 ms in the same harness. Vertical taps operate across rows, preserving accumulation order. Tests compare the optimised convolution against the retained scalar reference, including unequal channel kernels, both border modes, narrow images and empty images.
+
+### Verification
+
+- `cargo test`: 188 unit tests passed; one pre-existing documentation example remains ignored.
+- `cargo test --no-default-features`: 185 unit tests passed; no GPU driver needed.
+- OpenGL and Vulkan parity tests executed on llvmpipe: all six layouts, all three modes, supersampling 1 and 4, default and non-default parameters. Largest measured channel difference from CPU: zero.
+- Pipeline metric parity checked across all layouts; CPU fallback checked with disabled features and a deliberately invalid Vulkan driver path.
+- CLI CPU / OpenGL / Vulkan printed identical metric tables for the default 64 px glyph. Raw and simulated snapshot panel regions were pixel-identical across the three backends. The tuning bar was excluded from pixel comparison because backend labels and measured times intentionally differ.
+- With `VK_ICD_FILENAMES=/nonexistent` and `__EGL_VENDOR_LIBRARY_FILENAMES=/nonexistent`, both parity tests skipped cleanly with an explanation. A Vulkan CLI run with the invalid driver path produced a CPU snapshot and an explicit warning.
+- Headless inspector tests check that attached-pipeline changes update metrics, simulation notes and frame revisions, preserve the simulated view, and retain the initial reset settings. Setting steps and clamps and tuning-bar layout are covered separately.
+
+### Not verified
+
+Vulkan validation layers are not installed (`/usr/share/vulkan/explicit_layer.d` is empty), so validation-layer execution was unavailable. Physical GPU execution, interactive keyboard handling, window-manager behaviour and perceived responsiveness have not been exercised here. Keyboard bindings need manual checking in the desktop inspector. Auto-tuning is synchronous and can take longer than a single setting adjustment; GPU acceleration does not accelerate simulation or auto-tuning.

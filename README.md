@@ -38,7 +38,7 @@ This project explores a third path: **display-aware perceptual text reconstructi
 
 ## Current Status
 
-**Phases 1 to 3 are complete.** The rendering sandbox, the zoomable inspector, the display simulator and the OLED-aware renderer (each colour sampled at its emitter, from supersampled coverage) are implemented and tested. Phase 4 (GPU backends, live tuning) is specified in [`phase4.md`](phase4.md).
+**Phases 1 to 4 are complete.** The rendering sandbox, the zoomable inspector, the display simulator and the OLED-aware renderer (each colour sampled at its emitter, from supersampled coverage) are implemented and tested. OpenGL and Vulkan backends compute the same grids, and the inspector supports live tuning with automatic CPU fallback.
 
 | Phase | Status | Description |
 |-------|--------|-------------|
@@ -46,7 +46,7 @@ This project explores a third path: **display-aware perceptual text reconstructi
 | **Phase 1.5** | ✅ Complete | Pipeline refactor — renderers return linear light |
 | **Phase 2** | ✅ Complete | Physical subpixel geometry, optical PSF blur, per-channel bleed, luminance reconstruction |
 | **Phase 3** | ✅ Complete | Emitter-position sampling on every layout, supersampled coverage, CSF-based metric and auto-tuning, panel files |
-| **Phase 4** | 🔲 Next | GPU acceleration (OpenGL, Vulkan), live tuning UI — see [`phase4.md`](phase4.md) |
+| **Phase 4** | ✅ Complete | OpenGL / Vulkan backends, CPU fallback, live tuning UI |
 
 ---
 
@@ -93,6 +93,28 @@ cargo run --release -- \
 # Available layouts: rgb | bgr | pentile | delta | wrgb | grey
 # On Ubuntu, a good test font: /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
 # On macOS:                     /Library/Fonts/Arial.ttf
+```
+
+### GPU backends
+
+```bash
+cargo run --release -- --backend opengl
+cargo run --release -- --backend vulkan --start-simulated
+cargo run --release --no-default-features -- --backend cpu
+```
+
+CPU is the default. Cargo features `opengl` and `vulkan` are both enabled by default; `--no-default-features` builds without GPU libraries. EGL and Vulkan drivers are loaded at runtime. A missing driver, disabled feature or rendering failure falls back to CPU with a warning; the tuning bar shows the backend actually used and the error. Failed initialisation is remembered.
+
+OpenGL renders a full-target triangle into an RGBA32F texture through an off-screen EGL context. Vulkan dispatches an 8×8 compute shader over host-visible buffers. Both share the GLSL kernels and emitter sampling in `shaders/common.glsl`; neither presents the window. Simulation and auto-tuning stay on the CPU.
+
+The reported render time includes all three modes and readback, excluding backend creation. Drivers can still defer work until the first draw, so the first run can be slower. The tuning bar reports the latest run. For repeatable warm timings, run `cargo run --release --example pipeline_timing -- /path/to/font.ttf` (optional second argument: simulation scale).
+
+The four settings are luma and chroma footprint (0.25–3 px, step 0.05), edge suppression (0–1, step 0.05), and viewing distance (200–1500 mm, step 25). Select with Tab and adjust with brackets. Backend switching and edits keep the current zoom and view. Auto-tuning requires simulation and may take longer than an individual adjustment.
+
+Snapshots include the bar and need no display server:
+
+```bash
+cargo run --release -- --backend vulkan --snapshot /tmp/kage.ppm
 ```
 
 ### The display simulation
@@ -181,6 +203,11 @@ These are simulator results on nominal geometry, not measurements of real panels
 | `L` | Toggle luminance-only view |
 | `E` | Simulated view: auto-exposure ↔ clip |
 | `H` | Toggle per-channel heatmap overlay |
+| `Tab` / `Shift+Tab` | Select next / previous tuning setting |
+| `[` / `]` | Decrease / increase selected setting (repeats while held) |
+| `T` | Auto-tune OLED-aware parameters using the CPU simulator |
+| `B` | Cycle CPU → OpenGL → Vulkan |
+| `Backspace` | Reset settings and backend to their starting values |
 | `Esc` | Quit |
 
 The window has a normal title bar, so it can be maximised, tiled or closed like any other. On Wayland desktops KAGE opens through XWayland to get one, because the windowing library draws no title bar of its own on compositors such as GNOME; set `KAGE_BACKEND=wayland` to use the native backend instead.
@@ -199,6 +226,7 @@ font::loader::FontFace
       ▼
 coverage::Coverage          lo: 1 sample / pixel     hi: N×N samples / pixel   (linear area coverage)
       │
+      │     CPU renderers below, or gpu::{opengl, vulkan} with shared GLSL
       ├──▶ render::grayscale    lo copied to R, G, B              ──┐
       ├──▶ render::subpixel_aa  lo through a fixed 3×3 kernel     ──┤──▶ SubpixelGrid (linear light, 1 RGB / pixel)
       └──▶ render::oled_aware   hi averaged over a footprint      ──┘         │
@@ -254,6 +282,7 @@ At the default viewing conditions the sweep found one-pixel footprints for all c
 | `PanelGeometry` | `src/simulate/panel.rs` | Unit cell of emitters: position, aperture, colour |
 | `PanelDescription` | `src/simulate/panel_file.rs` | A panel loaded from `.toml` |
 | `SimulationParams` | `src/simulate/mod.rs` | PSF sigma and per-channel bleed |
+| `Backend` / `Gpu` / `RenderJob` | `src/gpu/mod.rs` | Backend selection, lazy drivers and shared shader inputs |
 | `Pipeline` / `Tuning` | `src/pipeline.rs` | Glyph → renderers → simulation → metrics; auto-tune |
 | `ViewSet` | `src/viz/inspector.rs` | The three modes' grids at one pipeline stage |
 | `Inspector` | `src/viz/inspector.rs` | minifb window, zoom/pan/heatmap/simulate |
@@ -319,11 +348,14 @@ All renderers return **linear-light** grids and fall back to greyscale on HiDPI 
 
 **Blur.** Sigma is in logical pixels. It comes from `--psf-sigma`, or from a fixed angular PSF at the eye: `sigma_px = (fwhm_rad × distance / pitch) / 2.355`. Because the PSF is an angle, sigma in pixels grows with viewing distance and with pixel density. The simulated image has the glyph bitmap's extent; blur that would land outside it is dropped.
 
+### `src/gpu/` — GPU backends
+`mod.rs` defines `Backend`, `RenderJob`, the std140 `ShaderParams` block and lazy `Gpu` initialisation. `opengl.rs` runs fragment shaders through dynamically loaded EGL; `vulkan.rs` compiles GLSL with naga and dispatches compute work through ash. `shaders.rs` assembles the shared files in `shaders/`. Both return linear `SubpixelGrid`s, with parity tests for every layout and mode.
+
 ### `src/pipeline.rs` — `Pipeline`
-Owns the glyph coverage, the panel and the profile; `run(&Tuning)` renders the three modes, simulates and scores them, caching what a settings change does not affect. `auto_tune()` is a coordinate descent over footprint widths and edge suppression that minimises luminance error plus visible chroma.
+Owns the glyph coverage, the panel and the profile; `run(&Tuning)` renders the three modes, simulates and scores them, caching what a settings change does not affect. All three modes run on the selected backend; errors recompute the whole run on CPU and are reported in `Output`. Baseline simulation caches retain CPU grids to avoid invalidation by insignificant GPU rounding. `auto_tune()` is a coordinate descent over footprint widths and edge suppression that minimises luminance error plus visible chroma.
 
 ### `src/viz/inspector.rs` — `Inspector`
-minifb window with a header, three titled panels and a key-hint footer; zoom (1–64×), pan, single-panel and side-by-side modes, a raw ↔ simulated toggle, a luminance-only view, and a false-colour heatmap overlay for channel imbalance analysis. It holds linear-light `ViewSet`s, re-encodes only when the view changes, and redraws only when something on screen changes.
+minifb window with a header, three titled panels, a tuning bar and a key-hint footer; zoom (1–64×), pan, single-panel and side-by-side modes, a raw ↔ simulated toggle, a luminance-only view, and a false-colour heatmap overlay for channel imbalance analysis. `attach_pipeline()` enables live settings, auto-tuning and backend switching. `--snapshot` uses the same drawing code without opening a window. It holds linear-light `ViewSet`s, re-encodes only when the view changes, and redraws only when something on screen changes.
 
 ### `src/viz/text.rs` — `TextRenderer`
 Draws the inspector's own interface text: glyphs rasterized through `FontFace`, cached per size and blended in linear light. Uses the system default font. At zoom ≥ 8× a pixel grid is drawn over the zoomed output. The label strip uses colour-coded accent bars (blue = greyscale, orange = subpixel AA, green = OLED-aware).
@@ -368,13 +400,12 @@ Draws the inspector's own interface text: glyphs rasterized through `FontFace`, 
 - [x] Fringe suppression for RGB/BGR stripe — same emitter-sampling path as every other layout
 - [x] Per-panel geometry and bleed loaded from `.toml` — `--panel`, `layouts/` (the loader is done; the shipped files are nominal, no measured panel data exists yet)
 
-### Phase 4 — GPU Acceleration 🔲
-Specified in [`phase4.md`](phase4.md).
-- [ ] OpenGL rendering backend
-- [ ] GLSL fragment shader implementations of all three render modes
-- [ ] Vulkan compute shader backend
-- [ ] Interactive real-time parameter tuning UI
-- [ ] `src/gpu/` module
+### Phase 4 — GPU Acceleration ✅
+- [x] OpenGL rendering backend
+- [x] GLSL fragment shader implementations of all three render modes
+- [x] Vulkan compute shader backend
+- [x] Interactive real-time parameter tuning UI
+- [x] `src/gpu/` module
 
 ---
 
@@ -384,11 +415,11 @@ Specified in [`phase4.md`](phase4.md).
 |-----------|------------|
 | Language | Rust (edition 2021) |
 | Font loading & rasterization | `freetype` crate (FreeType 2) |
-| Windowing / framebuffer | `minifb` (software, no GPU) |
+| Windowing / framebuffer | `minifb` software presentation |
 | CLI | `clap` v4 (derive API) |
 | Panel files | `toml` + `serde` |
 | Rendering — Phases 1–3 | CPU software renderer |
-| Rendering — Phase 4 | OpenGL fragment shader, Vulkan compute shader |
+| Rendering — Phase 4 | `glow` + dynamic `khronos-egl`; `ash` + `naga` GLSL → SPIR-V |
 
 ---
 
@@ -404,6 +435,7 @@ kage/
 │   ├── coverage.rs                # Coverage — pixel + supersampled glyph coverage
 │   ├── pipeline.rs                # Pipeline — render, simulate, score, auto-tune
 │   ├── profile.rs                 # DisplayProfile — EOTF, white point, DPI
+│   ├── gpu/                       # Lazy backends, shared parameters, OpenGL and Vulkan
 │   ├── font/
 │   │   ├── mod.rs                 # Re-exports FontFace
 │   │   └── loader.rs              # FreeType loader, scaled rasterization
@@ -432,16 +464,18 @@ kage/
 │   └── viz/
 │       ├── mod.rs                 # Re-exports Inspector, ViewSet
 │       ├── inspector.rs           # minifb window: header, panels, zoom, pan, raw/simulated views
+│       ├── tuning.rs              # Live setting ranges, steps and accessors
 │       └── text.rs                # Text drawing for the inspector's interface
+├── shaders/                       # Shared GLSL, fragment and compute wrappers
+├── examples/                      # Reproducible pipeline timing harness
 ├── layouts/                       # Panel description files (.toml) and their format
 ├── docs/                          # Screenshots used in this README
 ├── Cargo.toml
 ├── devlog.md
-├── phase4.md                      # Specification for Phase 4
 └── README.md
 ```
 
-Planned but not yet present: `shaders/` and `src/gpu/` (Phase 4).
+
 
 ---
 

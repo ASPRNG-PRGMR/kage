@@ -39,8 +39,11 @@
 //! ```
 //!
 //! [`pipeline::Pipeline`] runs that chain and computes the metrics.
+//! [`gpu`] optionally replaces the CPU rendering stage with shared GLSL
+//! fragment (OpenGL) or compute (Vulkan) shaders, falling back to CPU on error.
+//! The inspector attaches a pipeline for live settings and backend switching.
 //!
-//! ## Status — Phases 1 to 3 complete
+//! ## Status — Phases 1 to 4 complete
 //!
 //! - `profile`   — display EOTF, white point, DPI
 //! - `layout`    — subpixel layouts, fixed filter kernels (stripe, Pentile,
@@ -55,7 +58,8 @@
 //! - `simulate`  — physical subpixel geometry (built-in or from `.toml`),
 //!   optical PSF blur, per-channel bleed, luminance reconstruction, metrics
 //! - `pipeline`  — glyph → renderers → simulation → metrics, auto-tuning
-//! - `viz`       — zoomable subpixel inspector (minifb) with raw / simulated views
+//! - `gpu`       — lazy OpenGL / Vulkan backends returning linear grids
+//! - `viz`       — zoomable inspector with live tuning and headless snapshots
 
 pub mod coverage;
 pub mod font;
