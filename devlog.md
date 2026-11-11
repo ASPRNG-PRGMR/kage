@@ -498,3 +498,70 @@ cargo run --release -- --font /path/to/font.ttf --glyph g --simulate --psf-sigma
 # Physically derived sigma from viewing distance
 cargo run --release -- --font /path/to/font.ttf --glyph g --simulate --viewing-dist 600
 ```
+
+---
+
+## Session 11 — Phase 2 completed: physical panel model, luminance reconstruction, audit fixes
+**Date:** 2026-11-11
+
+An audit of Phases 1–2 against the README checklists. Phase 2 had one failing test and two checklist items with no implementation; Phase 1 had a geometry error and two filter bugs.
+
+### Fixes to existing code
+
+**Viewing-distance sigma was backwards in the test and docs, and the default was too small.**
+`viewing_distance_to_sigma()` treats the PSF as a fixed angle at the eye, so the patch of panel it covers — and sigma in pixels — grows with distance. The test asserted it should halve (and was failing), and `psf.rs` said the same. The function was right; the test and docs were corrected. Separately, the hardcoded 0.5 arcmin FWHM gave sigma ≈ 0.13 px at 109 dpi / 500 mm, not the documented 0.45 px, so `--simulate` without `--psf-sigma` was almost a no-op. The default is now `DEFAULT_PSF_FWHM_ARCMIN = 1.7` (in the 1–2 arcmin range of the eye's optical PSF), which gives 0.45 px, and is exposed as `--psf-fwhm`.
+
+**Pentile RGBG geometry.**
+`channel_weights()` put red only at (even col, even row) and blue only at (odd, odd), leaving half the pixels with green alone. Pentile RGBG pixels are `[R G]` or `[B G]`, alternating in a checkerboard. The reconstruction in `filter_row()` — "R absent, average the horizontal neighbours, they have R" — already assumed the checkerboard and was wrong on odd rows under the old weights. Red is now present where `col + row` is even, blue where it is odd. This changes pentile output on odd rows.
+
+**Filter borders.**
+`pentile::filter_row()` never wrote the first and last column (black border columns), and both it and the RGB stripe filter returned early for rows under 3 pixels, so a 1–2 px wide glyph (`l`, `|`, `.` at small sizes) rendered black in both subpixel modes. Both now use clamp-to-edge taps and write every column.
+
+**`--no-fringe` did nothing.** It is now wired: it renders the OLED-Aware panel without fringe suppression.
+
+### New: `src/simulate/panel.rs` — physical subpixel arrangements
+
+`PanelGeometry` is a unit cell of `Emitter`s (colour, centre, aperture) in logical-pixel units, with a preset per `SubpixelLayout`. `emit(grid, geometry, scale)` paints a rendered grid onto an emission map `scale×` larger, each emitter lit at its own position. Pentile pixels show only the colours they physically have; WRGB sends `min(r, g, b)` to the white emitter and the remainder to the colour emitters.
+
+Emission is luminance-preserving: radiance = pixel value ÷ the channel's fill factor. A white field integrates back to white on every layout (tested), and bare emitters legitimately exceed 1.0.
+
+`simulate_panel()` = `emit()` then the per-channel PSF with sigma scaled to map samples. `integrate_pixels()` box-integrates back to one value per pixel.
+
+**On "from datasheets":** the presets carry each layout's topology with *nominal* aperture sizes. They are not measured values for any specific panel — none were available to derive them from. `PanelGeometry` is public plain data so measured numbers can be dropped in; loading them from `.toml` is listed under Phase 3.
+
+**Border handling.** Blurring an emission map with clamp-to-edge repeats the edge sample outward, and that sample is often a single lit emitter — strokes touching the bitmap edge grew a coloured streak about twice the image brightness. The convolution gained a `Border` mode; `simulate_panel()` uses `Border::Zero` (surroundings are black). Consequence: blur that would land outside the glyph bitmap is dropped, not shown.
+
+### New: luminance reconstruction in `src/simulate/gamma.rs`
+
+`relative_luminance()` / `reconstruct_luminance()` sum R, G, B with Rec. 709 weights **in linear light**, before EOTF encoding — the only domain where light from separate emitters adds. Two metrics on top:
+
+- `luminance_rms_error(reference, candidate)` — how far a simulated image's luminance is from the intended one
+- `chroma_rms(grid)` — colour residue; for white-on-black text this is fringing
+
+`--simulate` prints both per rendering mode.
+
+### Inspector
+
+- Owns two `ViewSet`s (raw, simulated) and encodes once per view change. Previously it cloned and EOTF-encoded all three grids every frame, which would not scale to oversampled maps.
+- Zoom and pan are in logical pixels; a `ViewSet` carries its samples-per-pixel, so the simulated image stays aligned with the raw one when toggling.
+- `L` — luminance-only view. `E` — auto-exposure ↔ clip for the simulated view. Window title shows the active view.
+- Scroll zoom anchored on the window x-coordinate rather than the position within the panel under the cursor, so it drifted in panels 2 and 3. Fixed.
+- Mouse drag rounded each frame's delta to whole pixels and discarded the rest, so slow drags did not move. The remainder now accumulates.
+- Pixel grid lines used a rounded zoom and drifted at fractional zoom levels. They now use the same mapping as the blit.
+
+### API changes
+
+- `Inspector::new(title, raw: ViewSet, simulated: Option<ViewSet>, profile)`; `Inspector::update()` takes no arguments.
+- `simulate()` is unchanged (per-pixel blur, clamp borders). `simulate_panel()` is the full model.
+
+### Verification
+
+99 unit tests pass (was 54 passing, 1 failing). The simulated views for all layouts were rendered to images and checked by eye; the interactive window was launched on each layout but its keyboard and mouse handling was not exercised by hand.
+
+### Known limits carried into Phase 3
+
+- Fringe suppression exists only for Pentile RGBG; on RGB/BGR stripe the Subpixel AA and OLED-Aware panels are identical.
+- Delta-RGB still renders as greyscale (no 2-D kernel), though its simulated emitters are triangular.
+- `BleedProfile` multipliers and all aperture sizes are nominal.
+- Scroll direction on Wayland is still unconfirmed; the debug-build diagnostic print remains.
+

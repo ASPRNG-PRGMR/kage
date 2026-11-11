@@ -14,7 +14,7 @@
 //! ```
 //!
 //! EOTF encoding is intentionally kept out of the individual renderers.
-//! All filtering, blending, and future optical-blur simulation (Phase 2)
+//! All filtering, blending, and display simulation (`crate::simulate`)
 //! must operate in linear light.  The caller applies [`encode_grid`] as
 //! the final step before writing to a u8 framebuffer.
 
@@ -31,7 +31,7 @@ use crate::layout::SubpixelLayout;
 use crate::profile::DisplayProfile;
 use crate::subpixel::SubpixelGrid;
 
-/// The three rendering strategies available in Phase 1.
+/// The three rendering strategies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderMode {
     /// Greyscale antialiasing — all channels equal, no subpixel colour.

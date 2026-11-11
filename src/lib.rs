@@ -26,12 +26,15 @@
 //! ```text
 //! font::loader  →  glyph::GlyphBuffer  →  render::{grayscale,subpixel_aa,oled_aware}
 //!                                                  ↓
-//!                                       subpixel::SubpixelGrid
-//!                                                  ↓
-//!                                         viz::Inspector  (minifb window)
+//!                                       subpixel::SubpixelGrid  (linear light)
+//!                                          ↓                ↓
+//!                                          │     simulate::simulate_panel
+//!                                          │     (emitter placement + PSF blur)
+//!                                          ↓                ↓
+//!                                         viz::Inspector  (EOTF-encodes, minifb window)
 //! ```
 //!
-//! ## Status — Phase 2 in progress
+//! ## Status — Phases 1, 1.5 and 2 complete
 //!
 //! Implemented:
 //! - `profile`   — display EOTF, white point, DPI
@@ -40,8 +43,9 @@
 //! - `font`      — FreeType font loading and rasterization (grey + LCD modes)
 //! - `subpixel`  — virtual subpixel grid, layout-aware filtering
 //! - `render`    — three rendering strategies: greyscale, subpixel AA, OLED-aware
-//! - `simulate`  — optical PSF blur, per-channel subpixel bleed (Phase 2)
-//! - `viz`       — zoomable subpixel inspector (minifb, keyboard-controlled)
+//! - `simulate`  — physical subpixel geometry, optical PSF blur, per-channel
+//!   bleed, gamma-aware luminance reconstruction and metrics
+//! - `viz`       — zoomable subpixel inspector (minifb) with raw / simulated views
 
 pub mod font;
 pub mod glyph;

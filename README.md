@@ -32,13 +32,13 @@ This project explores a third path: **display-aware perceptual text reconstructi
 
 ## Current Status
 
-**Phase 1 complete.** The full rendering sandbox and zoomable inspector are implemented and ready to build.
+**Phases 1, 1.5 and 2 are complete.** The rendering sandbox, the zoomable inspector and the display simulator (physical subpixel placement, optical blur, luminance reconstruction) are implemented and tested.
 
 | Phase | Status | Description |
 |-------|--------|-------------|
 | **Phase 1** | ✅ Complete | Rendering sandbox + zoomable inspector |
 | **Phase 1.5** | ✅ Complete | Pipeline refactor — renderers return linear light |
-| **Phase 2** | ✅ Complete | Optical PSF blur, per-channel bleed, simulate/raw toggle |
+| **Phase 2** | ✅ Complete | Physical subpixel geometry, optical PSF blur, per-channel bleed, luminance reconstruction |
 | **Phase 3** | 🔲 Next | Experimental rendering: luma/chroma decoupling, frequency-aware |
 | **Phase 4** | 🔲 Planned | GPU acceleration (OpenGL → Vulkan) |
 
@@ -83,6 +83,32 @@ cargo run --release -- \
 # On macOS:                     /Library/Fonts/Arial.ttf
 ```
 
+### Run the display simulation
+
+```bash
+# Simulate the panel: emitters at their physical positions, then optical blur.
+# Press S in the inspector to toggle raw ↔ simulated.
+cargo run --release -- --font /path/to/font.ttf --glyph g --layout pentile --simulate
+
+# Bare emitters, no blur — see the subpixel structure itself
+cargo run --release -- --font /path/to/font.ttf --glyph g --simulate --psf-sigma 0
+
+# Blur derived from viewing distance (mm) and panel DPI
+cargo run --release -- --font /path/to/font.ttf --glyph g --simulate --viewing-dist 700 --dpi 140
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--simulate` | off | Build the simulated panel image |
+| `--psf-sigma <px>` | derived | Blur sigma in logical pixels; `0` disables blur. Overrides the two flags below |
+| `--viewing-dist <mm>` | 500 | Eye-to-panel distance |
+| `--psf-fwhm <arcmin>` | 1.7 | Angular width of the PSF at the eye |
+| `--sim-scale <n>` | 6 | Emission-map samples per pixel per axis (1–16) |
+| `--dpi`, `--dpr` | 109, 1.0 | Panel density; also drives the HiDPI greyscale fallback |
+| `--no-fringe` | off | Disable adaptive fringe suppression in the OLED-Aware panel |
+
+With `--simulate` the CLI also prints two numbers per rendering mode: **luminance error** (RMS difference between the simulated image, integrated back to pixels, and the intended coverage) and **chroma residue** (RMS colour in what the viewer sees — fringing, for white-on-black text).
+
 ### Inspector controls
 
 | Input | Action |
@@ -90,15 +116,21 @@ cargo run --release -- \
 | Scroll wheel | Zoom in / out, anchored to cursor position |
 | `+` / `=` | Zoom in (keyboard) |
 | `-` | Zoom out (keyboard) |
-| Arrow keys | Pan |
+| Click + drag | Pan |
+| Arrow keys | Pan by one pixel |
 | `1` | Greyscale AA only |
 | `2` | Subpixel AA (ClearType-style) only |
 | `3` | OLED-Aware only |
 | `A` | Side-by-side comparison (default) |
+| `S` | Toggle raw render ↔ simulated panel (needs `--simulate`) |
+| `L` | Toggle luminance-only view |
+| `E` | Simulated view: auto-exposure ↔ clip |
 | `H` | Toggle per-channel heatmap overlay |
 | `Esc` | Quit |
 
-The default view is **side-by-side**: Greyscale AA | Subpixel AA | OLED-Aware, left to right. At zoom ≥ 8× individual pixel grid lines are drawn. The heatmap mode (`H`) false-colours the image to make R/B channel imbalance visible — useful for measuring fringing.
+The window title shows which view is active. The default view is **side-by-side**: Greyscale AA | Subpixel AA | OLED-Aware, left to right. At zoom ≥ 8× individual pixel grid lines are drawn. The heatmap mode (`H`) false-colours the image to make R/B channel imbalance visible — useful for measuring fringing.
+
+In the simulated view each logical pixel is drawn from its individual emitters, so zooming in shows the real subpixel structure. The simulated image is luminance-preserving, which makes bare emitters brighter than 1.0; auto-exposure (on by default) scales all three panels by one common factor so they stay comparable, and `E` switches to clipping instead.
 
 ---
 
@@ -111,13 +143,22 @@ font::loader::FontFace
 glyph::GlyphBuffer          [R, G, B, A: f32]  linear light, width×height×4
       │
       ├──▶ render::grayscale    ──┐
-      ├──▶ render::subpixel_aa  ──┤──▶ SubpixelGrid (linear light)
+      ├──▶ render::subpixel_aa  ──┤──▶ SubpixelGrid (linear light, 1 sample / pixel)
       └──▶ render::oled_aware   ──┘         │
-                                      render::encode_grid()   ← EOTF applied once
+                                            ├───────────────────────────┐
+                                            │                  simulate::simulate_panel()
+                                            │                    panel::emit()   emitters at physical positions
+                                            │                    psf + bleed     per-channel Gaussian blur
+                                            │                           │
+                                            │              SubpixelGrid (linear light, N×N samples / pixel)
+                                            ▼                           ▼
+                                    viz::Inspector   S toggles raw ↔ simulated
+                                      (luminance) → (exposure) → render::encode_grid()   ← EOTF applied once
                                              │
-                                    viz::Inspector   (minifb window, zoom/pan/heatmap)
-                                    simulate::*      (Phase 2 — operates in linear light)
+                                        framebuffer
 ```
+
+Everything upstream of `encode_grid()` is linear light. Filtering, blur and luminance sums are only physically meaningful there.
 
 ### Key data types
 
@@ -130,7 +171,10 @@ glyph::GlyphBuffer          [R, G, B, A: f32]  linear light, width×height×4
 | `SubpixelGrid` | `src/subpixel/grid.rs` | Per-pixel (R,G,B) energy after layout filtering |
 | `DisplayProfile` | `src/profile.rs` | EOTF, white point, DPI, DPR |
 | `RenderMode` | `src/render/mod.rs` | Greyscale / SubpixelAa / OledAware |
-| `Inspector` | `src/viz/inspector.rs` | minifb window, zoom/pan/heatmap |
+| `PanelGeometry` | `src/simulate/panel.rs` | Unit cell of emitters: position, aperture, colour |
+| `SimulationParams` | `src/simulate/mod.rs` | PSF sigma and per-channel bleed |
+| `ViewSet` | `src/viz/inspector.rs` | The three modes' grids at one pipeline stage |
+| `Inspector` | `src/viz/inspector.rs` | minifb window, zoom/pan/heatmap/simulate |
 
 ---
 
@@ -146,13 +190,13 @@ Describes the physical display: EOTF (sRGB, Gamma, PQ), white point (D65, DCI-P3
 Enum of panel geometries: `RgbStripe`, `BgrStripe`, `PentileRgbg`, `DeltaRgb`, `Wrgb`, `Greyscale`. `subpixel_rendering_useful()` returns false for WRGB and Greyscale (chromatic penalty exceeds gain). `channel_weights(col_parity, row_parity)` returns per-channel presence weights for layout-aware filtering.
 
 ### `src/layout/pentile.rs` — Pentile RGBG geometry
-FIR kernel constants (`GREEN_FIR`, `RED_FIR`, `BLUE_FIR`), `filter_row()` applying them, `chromatic_penalty()` computing the normalised discrete Laplacian, and `adaptive_blend()` lerping between subpixel and greyscale outputs.
+Every pixel is `[R G]` or `[B G]`, red and blue alternating in a checkerboard. FIR kernel constants (`GREEN_FIR`, `RED_FIR`, `BLUE_FIR`), `filter_row()` applying them, `chromatic_penalty()` computing the normalised discrete Laplacian, and `adaptive_blend()` lerping between subpixel and greyscale outputs.
 
 ### `src/font/loader.rs` — `FontFace`, `GlyphBitmap`
 FreeType-backed loader. `rasterize_grey()` produces 8-bit greyscale coverage. `rasterize_lcd()` produces 3-byte-per-pixel RGB subpixel output (FreeType's built-in LCD filter applied). `GlyphBitmap::into_glyph_buffer()` converts to linear-light `GlyphBuffer` via sRGB EOTF decode.
 
 ### `src/subpixel/grid.rs` — `SubpixelGrid`
-Virtual subpixel grid. `from_glyph(buf, layout, fringe_suppress)` applies the layout-appropriate filter row by row. `to_argb8_display()` packs into `Vec<u32>` for minifb. The RGB stripe path uses a 3-tap phase-shifted FIR. Pentile uses `layout::pentile::filter_row()` plus optional `adaptive_blend()`.
+Virtual subpixel grid. `from_glyph(buf, layout, fringe_suppress)` applies the layout-appropriate filter row by row. `to_argb8_display()` packs into `Vec<u32>` for minifb. The RGB stripe path uses a 3-tap phase-shifted FIR. Pentile uses `layout::pentile::filter_row()` plus optional `adaptive_blend()`. Both filters clamp to the edge, so every column is written whatever the glyph width.
 
 ### `src/render/` — Three rendering strategies
 
@@ -162,10 +206,36 @@ Virtual subpixel grid. `from_glyph(buf, layout, fringe_suppress)` applies the la
 | `subpixel_aa.rs` | Layout FIR applied, linear light | No |
 | `oled_aware.rs` | Layout FIR + adaptive blend, linear light | Yes |
 
-All three return **linear-light** grids. All three auto-fall-back to greyscale on HiDPI or WRGB layouts. `encode_grid()` in `render/mod.rs` is the single point where EOTF encoding happens, called by the inspector (and in future by the simulate module) immediately before display.
+All three return **linear-light** grids. All three auto-fall-back to greyscale on HiDPI or WRGB layouts. `encode_grid()` in `render/mod.rs` is the single point where EOTF encoding happens, called by the inspector immediately before display.
+
+Fringe suppression is currently implemented for Pentile RGBG only, so on RGB/BGR stripe the Subpixel AA and OLED-Aware outputs are identical. Delta-RGB has no 2-D kernel yet and renders as greyscale in both subpixel modes (Phase 3).
+
+### `src/simulate/` — Display simulation
+
+| Module | Role |
+|--------|------|
+| `panel.rs` | `PanelGeometry`: emitters per unit cell. `emit()` paints a grid onto an oversampled emission map; `integrate_pixels()` goes back to one value per pixel |
+| `psf.rs` | Gaussian kernel builder and separable convolution, with clamp or black borders |
+| `bleed.rs` | `BleedProfile`: per-channel sigma multipliers (red 1.20, green 1.00, blue 1.10) |
+| `gamma.rs` | Viewing distance → sigma, linear-light guard, luminance reconstruction, luminance-error and chroma metrics |
+| `mod.rs` | `SimulationParams`, `simulate()` (per-pixel blur only), `simulate_panel()` (emitters + blur) |
+
+**Panel geometries.** `PanelGeometry::for_layout()` returns a preset for each `SubpixelLayout`. The presets encode each layout's *topology* — which emitters exist, their order and relative placement — with **nominal** aperture sizes. They are not measurements of a particular panel. `PanelGeometry` is plain public data in logical-pixel units, so values measured from a datasheet or a macro photo can be supplied directly (divide micrometres by the pixel pitch).
+
+| Layout | Unit cell | Emitters |
+|--------|-----------|----------|
+| RGB / BGR stripe | 1×1 | Three tall bars |
+| Pentile RGBG | 2×2 | Narrow green in every pixel, larger red or blue alternating in a checkerboard |
+| Delta RGB | 1×1 | Green above; red and blue side by side about half a pixel below |
+| WRGB | 1×1 | Four bars, R W B G; the achromatic part of a pixel goes to white |
+| Greyscale | 1×1 | One full-pixel source |
+
+**Energy.** Emission is luminance-preserving: each emitter is driven brighter than the pixel value by the inverse of its channel's fill factor, so a white field integrates back to white on every layout.
+
+**Blur.** Sigma is in logical pixels. It comes from `--psf-sigma`, or from a fixed angular PSF at the eye: `sigma_px = (fwhm_rad × distance / pitch) / 2.355`. Because the PSF is an angle, sigma in pixels grows with viewing distance and with pixel density. The simulated image has the glyph bitmap's extent; blur that would land outside it is dropped.
 
 ### `src/viz/inspector.rs` — `Inspector`
-minifb window with zoom (1–32×), pan, three single-panel views, side-by-side mode, and a false-colour heatmap overlay for channel imbalance analysis. At zoom ≥ 8× a pixel grid is drawn over the zoomed output. The label strip uses colour-coded accent bars (blue = greyscale, orange = subpixel AA, green = OLED-aware).
+minifb window with zoom (1–64×), pan, three single-panel views, side-by-side mode, a raw ↔ simulated toggle, a luminance-only view, and a false-colour heatmap overlay for channel imbalance analysis. It holds linear-light `ViewSet`s and re-encodes only when the view changes. At zoom ≥ 8× a pixel grid is drawn over the zoomed output. The label strip uses colour-coded accent bars (blue = greyscale, orange = subpixel AA, green = OLED-aware).
 
 ---
 
@@ -188,13 +258,14 @@ minifb window with zoom (1–32×), pan, three single-panel views, side-by-side 
 - [x] Inspector calls `encode_grid()` per frame before blitting
 - [x] Phase 2 simulate module can now receive linear grids directly
 
-### Phase 2 — Display Simulation 🔲
-- [ ] Optical PSF (point spread function) convolution
-- [ ] Subpixel light bleed and lateral diffusion
-- [ ] Model physical OLED subpixel arrangements from datasheets
-- [ ] Gamma-aware luminance reconstruction
-- [ ] `src/simulate/optical_blur.rs`
-- [ ] `src/simulate/gamma.rs`
+### Phase 2 — Display Simulation ✅
+- [x] Optical PSF (point spread function) convolution — `src/simulate/psf.rs`
+- [x] Subpixel light bleed and lateral diffusion — `src/simulate/bleed.rs`
+- [x] Model physical OLED subpixel arrangements — `src/simulate/panel.rs` (nominal presets per layout; datasheet values plug into `PanelGeometry`)
+- [x] Gamma-aware luminance reconstruction — `src/simulate/gamma.rs`
+- [x] PSF sigma derived from viewing distance and DPI
+- [x] Inspector: raw ↔ simulated toggle, luminance view, exposure control
+- [x] Luminance-error and chroma-residue metrics printed per rendering mode
 
 ### Phase 3 — Experimental Rendering Techniques 🔲
 - [ ] Luma/chroma decoupling (sharpen luma, suppress chroma at edges)
@@ -203,6 +274,8 @@ minifb window with zoom (1–32×), pan, three single-panel views, side-by-side 
 - [ ] Perceptual filtering matched to human contrast sensitivity function (CSF)
 - [ ] Delta-RGB (QD-OLED) 2-D kernel (currently falls back to greyscale)
 - [ ] WRGB white-channel luminance reconstruction
+- [ ] Fringe suppression for RGB/BGR stripe (currently Pentile only)
+- [ ] Measured per-panel geometries and bleed, loaded from `.toml`
 
 ### Phase 4 — GPU Acceleration 🔲
 - [ ] OpenGL rendering backend
@@ -221,7 +294,7 @@ minifb window with zoom (1–32×), pan, three single-panel views, side-by-side 
 | Font loading & rasterization | `freetype` crate (FreeType 2) |
 | Windowing / framebuffer | `minifb` (software, no GPU) |
 | CLI | `clap` v4 (derive API) |
-| Rendering — Phase 1 | CPU software renderer |
+| Rendering — Phases 1–2 | CPU software renderer |
 | Rendering — Phase 3+ | OpenGL + GLSL shaders |
 | Rendering — Phase 4 | Vulkan + compute shaders |
 
@@ -250,20 +323,21 @@ kage/
 │   │   ├── grayscale.rs           # Greyscale AA renderer (returns linear light)
 │   │   ├── subpixel_aa.rs         # ClearType-style subpixel renderer (returns linear light)
 │   │   └── oled_aware.rs          # OLED-aware renderer (returns linear light)
-│   ├── simulate/                  # Phase 2 — optical blur, gamma reconstruction
-│   │   ├── mod.rs
-│   │   ├── optical_blur.rs
-│   │   └── gamma.rs
+│   ├── simulate/
+│   │   ├── mod.rs                 # SimulationParams, simulate(), simulate_panel()
+│   │   ├── panel.rs               # PanelGeometry, emit(), integrate_pixels()
+│   │   ├── psf.rs                 # Gaussian kernels, separable convolution
+│   │   ├── bleed.rs               # Per-channel bleed profile
+│   │   └── gamma.rs               # Sigma from viewing distance, luminance reconstruction, metrics
 │   └── viz/
-│       ├── mod.rs                 # Re-exports Inspector
-│       └── inspector.rs           # minifb window: zoom, pan, heatmap, side-by-side
-├── assets/
-│   └── fonts/                     # Place test .ttf / .otf files here
-├── layouts/                       # Future: .toml custom layout definitions
-├── shaders/                       # Future: GLSL shaders (Phase 4)
+│       ├── mod.rs                 # Re-exports Inspector, ViewSet
+│       └── inspector.rs           # minifb window: zoom, pan, heatmap, raw/simulated views
 ├── Cargo.toml
+├── devlog.md
 └── README.md
 ```
+
+Planned but not yet present: `layouts/` (custom `.toml` panel definitions) and `shaders/` + `src/gpu/` (Phase 4).
 
 ---
 

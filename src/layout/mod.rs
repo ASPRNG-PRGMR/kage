@@ -10,8 +10,11 @@
 //! # Adding a new layout
 //!
 //! 1. Add a variant to [`SubpixelLayout`].
-//! 2. Implement a module under `layout/` (see `pentile.rs` as the reference).
-//! 3. Register in [`SubpixelLayout::filter_weights`] and [`SubpixelLayout::channel_offsets`].
+//! 2. Implement a module under `layout/` (see `pentile.rs` as the reference)
+//!    and dispatch to it from `SubpixelGrid::from_glyph`.
+//! 3. Register it in [`SubpixelLayout::channel_weights`].
+//! 4. Describe its emitters in `PanelGeometry::for_layout`
+//!    (`simulate/panel.rs`) so the display simulator can draw it.
 
 pub mod pentile;
 
