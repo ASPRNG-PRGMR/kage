@@ -97,7 +97,7 @@ impl Emitter {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PanelGeometry {
     /// Human-readable name, shown by the CLI.
-    pub name: &'static str,
+    pub name: String,
     /// Unit cell width in logical pixels.
     pub cell_w: u32,
     /// Unit cell height in logical pixels.
@@ -124,7 +124,7 @@ impl PanelGeometry {
     /// Horizontal RGB stripe: three tall bars, red on the left.
     pub fn rgb_stripe() -> Self {
         Self {
-            name: "RGB stripe (nominal)",
+            name: "RGB stripe (nominal)".into(),
             cell_w: 1,
             cell_h: 1,
             emitters: vec![
@@ -138,7 +138,7 @@ impl PanelGeometry {
     /// Horizontal BGR stripe: as RGB stripe with red and blue swapped.
     pub fn bgr_stripe() -> Self {
         Self {
-            name: "BGR stripe (nominal)",
+            name: "BGR stripe (nominal)".into(),
             cell_w: 1,
             cell_h: 1,
             emitters: vec![
@@ -157,7 +157,7 @@ impl PanelGeometry {
         let blue = |px: f32, py: f32| Emitter::new(Blue, px + 0.28, py + 0.5, 0.36, 0.62);
         let green = |px: f32, py: f32| Emitter::new(Green, px + 0.76, py + 0.5, 0.18, 0.46);
         Self {
-            name: "Pentile RGBG (nominal)",
+            name: "Pentile RGBG (nominal)".into(),
             cell_w: 2,
             cell_h: 2,
             emitters: vec![
@@ -173,7 +173,7 @@ impl PanelGeometry {
     /// by side below it, so red and blue sit half a pixel lower than green.
     pub fn delta_rgb() -> Self {
         Self {
-            name: "Delta RGB (nominal)",
+            name: "Delta RGB (nominal)".into(),
             cell_w: 1,
             cell_h: 1,
             emitters: vec![
@@ -187,7 +187,7 @@ impl PanelGeometry {
     /// WOLED stripe with a white emitter: four bars in R, W, B, G order.
     pub fn wrgb() -> Self {
         Self {
-            name: "WRGB stripe (nominal)",
+            name: "WRGB stripe (nominal)".into(),
             cell_w: 1,
             cell_h: 1,
             emitters: vec![
@@ -202,7 +202,7 @@ impl PanelGeometry {
     /// No subpixel structure: each pixel is one full-aperture source.
     pub fn greyscale() -> Self {
         Self {
-            name: "Unstructured (full-pixel emitters)",
+            name: "Unstructured (full-pixel emitters)".into(),
             cell_w: 1,
             cell_h: 1,
             emitters: vec![

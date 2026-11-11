@@ -1,0 +1,32 @@
+# RGB stripe
+#
+# Nominal geometry: this file reproduces KAGE's built-in preset. It records
+# the layout's topology (which emitters exist and how they are arranged) with
+# plausible aperture sizes. It is NOT a measurement of any particular panel.
+# Copy it and replace the numbers with measured ones; see layouts/README.md.
+
+name   = "RGB stripe (nominal)"
+source = "KAGE built-in nominal preset"
+layout = "rgb"
+cell   = [1, 1]
+
+# Blur width per colour relative to green (nominal).
+[bleed]
+red   = 1.20
+green = 1.00
+blue  = 1.10
+
+[[emitter]]
+channel = "red"
+center  = [0.166667, 0.5]
+size    = [0.24, 0.78]
+
+[[emitter]]
+channel = "green"
+center  = [0.5, 0.5]
+size    = [0.24, 0.78]
+
+[[emitter]]
+channel = "blue"
+center  = [0.833333, 0.5]
+size    = [0.24, 0.78]

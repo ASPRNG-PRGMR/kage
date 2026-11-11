@@ -49,18 +49,21 @@
 pub mod bleed;
 pub mod gamma;
 pub mod panel;
+pub mod panel_file;
 pub mod psf;
 
 pub use bleed::BleedProfile;
 pub use gamma::{
     check_linear, chroma_rms, luminance_rms_error, reconstruct_luminance, relative_luminance,
-    viewing_distance_to_sigma, DEFAULT_PSF_FWHM_ARCMIN, LUMA_WEIGHTS,
+    viewing_distance_to_sigma, visible_chroma_rms, DEFAULT_PSF_FWHM_ARCMIN, LUMA_WEIGHTS,
 };
+pub use panel_file::PanelDescription;
 pub use panel::{emit, integrate_pixels, Emitter, EmitterChannel, PanelGeometry};
 pub use psf::{convolve_separable, convolve_separable_with, gaussian_kernel, kernel_radius, Border};
 
 use crate::profile::DisplayProfile;
-use crate::subpixel::SubpixelGrid;
+use crate::plane::Plane;
+use crate::subpixel::{SubpixelGrid, SubpixelPixel};
 
 // ── SimulationParams ──────────────────────────────────────────────────────────
 
@@ -204,6 +207,33 @@ pub fn simulate_panel(
     let (kr, kg, kb) = params.bleed.kernels(params.sigma * oversample as f32);
     // Outside the glyph bitmap is dark background, not more of the edge sample.
     convolve_separable_with(&emission, &kr, &kg, &kb, Border::Zero)
+}
+
+// ── simulate_ideal() ──────────────────────────────────────────────────────────
+
+/// What a display with no subpixel structure and unlimited resolution would
+/// show for `coverage`, seen through the same optics as [`simulate_panel`].
+///
+/// `coverage` must have `oversample` samples per logical pixel along each
+/// axis (a glyph rasterized that much finer than the pixel grid). The result
+/// is the reference the simulated panel images are measured against: it
+/// contains the glyph's real shape between pixel centres, which
+/// pixel-resolution coverage does not.
+pub fn simulate_ideal(coverage: &Plane, params: &SimulationParams, oversample: u32) -> SubpixelGrid {
+    let mut grid = SubpixelGrid::new(coverage.width, coverage.height);
+    for row in 0..coverage.height {
+        for col in 0..coverage.width {
+            let c = coverage.data[(row * coverage.width + col) as usize];
+            *grid.pixel_mut(col, row) = SubpixelPixel { r: c, g: c, b: c };
+        }
+    }
+    if params.sigma <= 0.0 {
+        return grid;
+    }
+    // One optical blur for all colours: the reference has no emitters to bleed.
+    let sigma = params.sigma * oversample.max(1) as f32;
+    let k = gaussian_kernel(sigma, kernel_radius(sigma));
+    convolve_separable_with(&grid, &k, &k, &k, Border::Zero)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

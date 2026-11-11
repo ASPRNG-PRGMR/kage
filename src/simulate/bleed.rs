@@ -26,7 +26,7 @@ use super::psf::{gaussian_kernel, kernel_radius};
 ///
 /// A multiplier of 1.0 means this channel uses exactly the base sigma.
 /// Values > 1.0 produce a wider PSF (more bleed) for that channel.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BleedProfile {
     /// Sigma multiplier for the red channel.
     pub red_mult: f32,

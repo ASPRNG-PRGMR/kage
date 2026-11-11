@@ -39,6 +39,7 @@
 //! distribution (which would be suspicious for a glyph rendered on a
 //! dark background). This is a development-time check only.
 
+use crate::plane::Plane;
 use crate::subpixel::{SubpixelGrid, SubpixelPixel};
 
 // ── Luminance reconstruction ──────────────────────────────────────────────────
@@ -128,6 +129,34 @@ pub fn chroma_rms(grid: &SubpixelGrid) -> f32 {
         }
     }
     (acc / n).sqrt() as f32
+}
+
+/// RMS of the colour a viewer can actually see in a simulated panel image.
+///
+/// [`chroma_rms`] counts every coloured emitter, including the pixel-scale
+/// pattern that the eye averages to grey. This metric first integrates the
+/// image back to one value per logical pixel (`scale` samples per pixel per
+/// axis), then low-passes its chroma with a Gaussian of `chroma_sigma_px`
+/// pixels — the eye's chromatic resolution, see [`crate::render::csf`] —
+/// and measures what is left. That remainder is colour fringing.
+pub fn visible_chroma_rms(simulated: &SubpixelGrid, scale: u32, chroma_sigma_px: f32) -> f32 {
+    let per_pixel = super::integrate_pixels(simulated, scale);
+    let (w, h) = (per_pixel.width, per_pixel.height);
+    if w == 0 || h == 0 {
+        return 0.0;
+    }
+    let chroma = |pick: fn(SubpixelPixel) -> f32| {
+        Plane::from_fn(w, h, |c, r| {
+            let px = per_pixel.pixel(c, r);
+            pick(px) - relative_luminance(px)
+        })
+        .blur(chroma_sigma_px)
+    };
+    let planes = [chroma(|p| p.r), chroma(|p| p.g), chroma(|p| p.b)];
+    let acc: f64 = (0..(w * h) as usize)
+        .map(|i| planes.iter().map(|p| (p.data[i] * p.data[i]) as f64).sum::<f64>() / 3.0)
+        .sum();
+    (acc / (w * h) as f64).sqrt() as f32
 }
 
 // ── Linear-light guard ────────────────────────────────────────────────────────

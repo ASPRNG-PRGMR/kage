@@ -25,6 +25,10 @@ minifb = "0.28"
 # CLI argument parsing.
 clap = { version = "4", features = ["derive"] }
 
+# Panel description files (layouts/*.toml).
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
 [profile.release]
 opt-level = 3
 lto = true
