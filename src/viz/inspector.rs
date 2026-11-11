@@ -30,6 +30,8 @@
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 
 use super::text::TextRenderer;
+use super::tuning::SETTINGS;
+use crate::pipeline::{simulation_note, Pipeline, Tuning};
 use crate::profile::DisplayProfile;
 use crate::render::encode_grid;
 use crate::simulate::reconstruct_luminance;
@@ -47,6 +49,7 @@ const FALLBACK_WIN_H: usize = 800;
 // Layout, in host pixels at interface scale 1.0 (see `Ui`).
 const HEADER_H: i32 = 112;
 const FOOTER_H: i32 = 48;
+const TUNING_H: i32 = 112;
 const MARGIN: i32 = 16;
 const GAP: i32 = 14;
 const CARD_HEAD_H: i32 = 96;
@@ -326,7 +329,7 @@ impl Ui {
 }
 
 /// Lay out the cards for a window of `win_w` × `win_h`.
-fn layout_cards(win_w: usize, win_h: usize, mode: DisplayMode, ui: Ui) -> Vec<Card> {
+fn layout_cards(win_w: usize, win_h: usize, mode: DisplayMode, ui: Ui, tuning_height: i32) -> Vec<Card> {
     let indices: &[usize] = match mode {
         DisplayMode::Greyscale => &[0],
         DisplayMode::SubpixelAa => &[1],
@@ -336,7 +339,7 @@ fn layout_cards(win_w: usize, win_h: usize, mode: DisplayMode, ui: Ui) -> Vec<Ca
     let n = indices.len() as i32;
     let (margin, gap, head) = (ui.len(MARGIN), ui.len(GAP), ui.len(CARD_HEAD_H));
     let top = ui.len(HEADER_H) + margin;
-    let bottom = win_h as i32 - ui.len(FOOTER_H) - margin;
+    let bottom = win_h as i32 - ui.len(FOOTER_H + tuning_height) - margin;
     let region_w = win_w as i32 - 2 * margin;
     let card_w = ((region_w - gap * (n - 1)) / n).max(0);
     let card_h = (bottom - top).max(0);
@@ -438,11 +441,20 @@ struct FrameState {
     luminance: bool,
     auto_exposure: bool,
     heatmap: bool,
+    revision: u64,
+    selected: usize,
 }
 
 /// Interactive zoomable subpixel inspector.
 pub struct Inspector {
-    window: Window,
+    window: Option<Window>,
+    pipeline: Option<Pipeline>,
+    tuning: Option<Tuning>,
+    starting: Option<Tuning>,
+    selected: usize,
+    revision: u64,
+    backend_status: String,
+    backend_error: Option<String>,
     config: InspectorConfig,
     text: Option<TextRenderer>,
     fb: Vec<u32>,
@@ -507,7 +519,16 @@ impl Inspector {
         simulated: Option<ViewSet>,
         profile: DisplayProfile,
     ) -> Result<Self, minifb::Error> {
-        let (screen_w, screen_h) = detect_screen_size();
+        Self::build(config, raw, simulated, profile, false)
+    }
+
+    /// Create a deterministic 1280×800 inspector for snapshots, without a display server.
+    pub fn headless(config: InspectorConfig, raw: ViewSet, simulated: Option<ViewSet>, profile: DisplayProfile) -> Result<Self, minifb::Error> {
+        Self::build(config, raw, simulated, profile, true)
+    }
+
+    fn build(config: InspectorConfig, raw: ViewSet, simulated: Option<ViewSet>, profile: DisplayProfile, headless: bool) -> Result<Self, minifb::Error> {
+        let (screen_w, screen_h) = if headless { (1600, 1000) } else { detect_screen_size() };
         let win_w = ((screen_w as f64 * SCREEN_FRACTION) as usize).max(640);
         let win_h = ((screen_h as f64 * SCREEN_FRACTION) as usize).max(400);
 
@@ -517,6 +538,7 @@ impl Inspector {
         // maximise / close buttons; fall back to native Wayland if that fails.
         let wayland_display = std::env::var_os("WAYLAND_DISPLAY");
         let mut wayland = wayland_display.as_ref().is_some_and(|v| !v.is_empty());
+        let win = if headless { None } else {
         let mut win = if prefer_x11() {
             std::env::remove_var("WAYLAND_DISPLAY");
             match Window::new(&config.window_title, win_w, win_h, options()) {
@@ -535,6 +557,8 @@ impl Inspector {
             Window::new(&config.window_title, win_w, win_h, options())?
         };
         win.set_target_fps(60);
+        Some(win)
+        };
 
         let (min_win_w, min_win_h) = if wayland { (win_w, win_h) } else { (480, 360) };
 
@@ -542,6 +566,8 @@ impl Inspector {
 
         let mut inspector = Self {
             window: win,
+            pipeline: None, tuning: None, starting: None, selected: 0, revision: 0,
+            backend_status: String::new(), backend_error: None,
             config,
             text,
             fb: vec![BG; win_w * win_h],
@@ -578,18 +604,18 @@ impl Inspector {
 
     /// Returns `true` as long as the window is open and Esc has not been pressed.
     pub fn is_open(&self) -> bool {
-        self.window.is_open() && !self.window.is_key_down(Key::Escape)
+        self.window.as_ref().is_some_and(|w| w.is_open() && !w.is_key_down(Key::Escape))
     }
 
     /// Process input events and redraw if anything changed.
     pub fn update(&mut self) -> Result<(), minifb::Error> {
         // Follow the window size, down to the minimum (see `min_win_w`).
-        let (new_w, new_h) = self.window.get_size();
+        let (new_w, new_h) = self.window.as_ref().map_or((self.win_w, self.win_h), Window::get_size);
         self.win_w = new_w.max(self.min_win_w);
         self.win_h = new_h.max(self.min_win_h);
         self.fb.resize(self.win_w * self.win_h, BG);
 
-        self.handle_input();
+        if self.window.is_some() { self.handle_input(); }
         if self.auto_fit {
             self.fit();
         }
@@ -600,9 +626,50 @@ impl Inspector {
             self.drawn = Some(state);
         }
 
-        self.window
-            .update_with_buffer(&self.fb, self.win_w, self.win_h)?;
+        if let Some(window) = &mut self.window { window.update_with_buffer(&self.fb, self.win_w, self.win_h)?; }
         Ok(())
+    }
+
+    /// Attach the live pipeline, remembering the initial settings for Backspace.
+    pub fn attach_pipeline(&mut self, pipeline: Pipeline, tuning: Tuning) {
+        self.pipeline = Some(pipeline);
+        self.tuning = Some(tuning);
+        self.starting = Some(tuning);
+        self.refresh_tuning();
+    }
+
+    fn refresh_tuning(&mut self) {
+        let (Some(pipeline), Some(tuning)) = (&mut self.pipeline, self.tuning) else { return; };
+        let out = pipeline.run(&tuning);
+        self.backend_status = format!("{}  {:.3} ms", out.backend, out.render_time.as_secs_f64() * 1000.0);
+        self.backend_error = out.backend_error.map(|e| format!("{} → CPU: {e}", tuning.backend));
+        self.config.simulation_note = out.simulated.as_ref().map(|_| simulation_note(out.sigma));
+        self.config.metrics = out.metrics;
+        self.raw = out.raw;
+        self.simulated = out.simulated;
+        self.revision += 1;
+        self.rebuild_view();
+    }
+
+    fn handle_tuning(&mut self) {
+        let Some(mut tuning) = self.tuning else { return; };
+        let window = self.window.as_ref().unwrap();
+        if window.is_key_pressed(Key::Tab, KeyRepeat::Yes) {
+            let backwards = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
+            self.selected = (self.selected + if backwards { SETTINGS.len() - 1 } else { 1 }) % SETTINGS.len();
+        }
+        for (key, direction) in [(Key::LeftBracket, -1.0), (Key::RightBracket, 1.0)] {
+            if window.is_key_pressed(key, KeyRepeat::Yes) { SETTINGS[self.selected].adjust(&mut tuning, direction); }
+        }
+        if window.is_key_pressed(Key::B, KeyRepeat::No) { tuning.backend = tuning.backend.next(); }
+        if window.is_key_pressed(Key::Backspace, KeyRepeat::No) { tuning = self.starting.unwrap(); }
+        if window.is_key_pressed(Key::T, KeyRepeat::No) {
+            if let Some(best) = self.pipeline.as_mut().and_then(|p| p.auto_tune(&tuning)) { tuning.render = best; }
+        }
+        if Some(tuning) != self.tuning {
+            self.tuning = Some(tuning);
+            self.refresh_tuning();
+        }
     }
 
     /// Switch between the raw render and the simulated panel image.
@@ -637,6 +704,8 @@ impl Inspector {
             luminance: self.luminance,
             auto_exposure: self.auto_exposure,
             heatmap: self.heatmap,
+            revision: self.revision,
+            selected: self.selected,
         }
     }
 
@@ -644,8 +713,12 @@ impl Inspector {
         Ui::for_window(self.win_h)
     }
 
+    fn tuning_height(&self) -> i32 {
+        if self.pipeline.is_none() { 0 } else if self.win_w < 800 { TUNING_H + 32 } else { TUNING_H }
+    }
+
     fn cards(&self) -> Vec<Card> {
-        layout_cards(self.win_w, self.win_h, self.display_mode, self.ui())
+        layout_cards(self.win_w, self.win_h, self.display_mode, self.ui(), self.tuning_height())
     }
 
     /// Whether the simulated image is what is currently on screen.
@@ -719,16 +792,17 @@ impl Inspector {
     }
 
     fn handle_input(&mut self) {
+        self.handle_tuning();
         // ── Scroll-wheel zoom, anchored to the cursor ──────────────────────
         //
         // Which axis carries vertical scroll differs between backends, so the
         // axis with the larger magnitude is used. Scrolling up zooms in: that
         // is a positive value on X11 and a negative one on Wayland.
-        if let Some((scroll_x, scroll_y)) = self.window.get_scroll_wheel() {
+        if let Some((scroll_x, scroll_y)) = self.window.as_ref().unwrap().get_scroll_wheel() {
             let raw = if scroll_x.abs() >= scroll_y.abs() { scroll_x } else { scroll_y };
             if raw.abs() > 0.05 {
                 let (mx, my) = self
-                    .window
+                    .window.as_ref().unwrap()
                     .get_mouse_pos(MouseMode::Clamp)
                     .unwrap_or((self.win_w as f32 / 2.0, self.win_h as f32 / 2.0));
 
@@ -754,10 +828,10 @@ impl Inspector {
         }
 
         // ── Keyboard zoom, about the viewport centre ───────────────────────
-        if self.window.is_key_pressed(Key::Equal, KeyRepeat::Yes) {
+        if self.window.as_ref().unwrap().is_key_pressed(Key::Equal, KeyRepeat::Yes) {
             self.zoom_about(ZOOM_STEP, 0.0, 0.0);
         }
-        if self.window.is_key_pressed(Key::Minus, KeyRepeat::Yes) {
+        if self.window.as_ref().unwrap().is_key_pressed(Key::Minus, KeyRepeat::Yes) {
             self.zoom_about(1.0 / ZOOM_STEP, 0.0, 0.0);
         }
 
@@ -768,7 +842,7 @@ impl Inspector {
             (Key::Up, 0.0, -1.0),
             (Key::Down, 0.0, 1.0),
         ] {
-            if self.window.is_key_pressed(key, KeyRepeat::Yes) {
+            if self.window.as_ref().unwrap().is_key_pressed(key, KeyRepeat::Yes) {
                 self.center_x += dx;
                 self.center_y += dy;
                 self.auto_fit = false;
@@ -776,26 +850,26 @@ impl Inspector {
         }
 
         // ── Reset ──────────────────────────────────────────────────────────
-        if self.window.is_key_pressed(Key::R, KeyRepeat::No) {
+        if self.window.as_ref().unwrap().is_key_pressed(Key::R, KeyRepeat::No) {
             self.auto_fit = true;
         }
 
         // ── View toggles (each changes what is encoded for display) ────────
         let mut view_changed = false;
 
-        if self.window.is_key_pressed(Key::S, KeyRepeat::No) && self.simulated.is_some() {
+        if self.window.as_ref().unwrap().is_key_pressed(Key::S, KeyRepeat::No) && self.simulated.is_some() {
             self.simulate_mode = !self.simulate_mode;
             view_changed = true;
         }
-        if self.window.is_key_pressed(Key::L, KeyRepeat::No) {
+        if self.window.as_ref().unwrap().is_key_pressed(Key::L, KeyRepeat::No) {
             self.luminance = !self.luminance;
             view_changed = true;
         }
-        if self.window.is_key_pressed(Key::E, KeyRepeat::No) {
+        if self.window.as_ref().unwrap().is_key_pressed(Key::E, KeyRepeat::No) {
             self.auto_exposure = !self.auto_exposure;
             view_changed = true;
         }
-        if self.window.is_key_pressed(Key::H, KeyRepeat::No) {
+        if self.window.as_ref().unwrap().is_key_pressed(Key::H, KeyRepeat::No) {
             self.heatmap = !self.heatmap;
         }
 
@@ -810,14 +884,14 @@ impl Inspector {
             (Key::Key3, DisplayMode::OledAware),
             (Key::A, DisplayMode::SideBySide),
         ] {
-            if self.window.is_key_pressed(key, KeyRepeat::No) {
+            if self.window.as_ref().unwrap().is_key_pressed(key, KeyRepeat::No) {
                 self.display_mode = mode;
             }
         }
 
         // ── Mouse drag pan: the glyph follows the cursor ───────────────────
-        let mouse_down = self.window.get_mouse_down(MouseButton::Left);
-        let mouse_pos = self.window.get_mouse_pos(MouseMode::Clamp).unwrap_or((0.0, 0.0));
+        let mouse_down = self.window.as_ref().unwrap().get_mouse_down(MouseButton::Left);
+        let mouse_pos = self.window.as_ref().unwrap().get_mouse_pos(MouseMode::Clamp).unwrap_or((0.0, 0.0));
 
         if mouse_down {
             if let Some((last_x, last_y)) = self.drag_last {
@@ -901,6 +975,7 @@ impl Inspector {
         for card in self.cards() {
             self.draw_card(card);
         }
+        self.draw_tuning();
         self.draw_footer();
     }
 
@@ -1099,6 +1174,31 @@ impl Inspector {
         }
     }
 
+    fn draw_tuning(&mut self) {
+        let Some(tuning) = self.tuning else { return; };
+        let ui = self.ui();
+        let y = self.win_h as i32 - ui.len(FOOTER_H + self.tuning_height());
+        let mut chip_y = y;
+        let right = self.win_w as i32 - ui.len(MARGIN);
+        let mut x = ui.len(MARGIN);
+        for (i, setting) in SETTINGS.iter().enumerate() {
+            let label = format!("{} {:.2} {}", setting.name, (setting.get)(&tuning), setting.unit);
+            let width = self.text_width(ui.px(SIZE_SMALL), &label) + ui.len(22);
+            if x + width > right { x = ui.len(MARGIN); chip_y += ui.len(32); }
+            self.chip_right(x + width, chip_y, &label, i == self.selected);
+            x += width + ui.len(8);
+        }
+        let status = self.backend_status.clone();
+        // At narrow widths, move status below the chips instead of overlapping them.
+        let status_y = if x + self.text_width(ui.px(SIZE_SMALL), &status) > right { chip_y + ui.len(32) } else { chip_y };
+        self.chip_right(right, status_y, &status, false);
+        self.text(ui.len(MARGIN), y + ui.len(self.tuning_height() - 48), ui.px(SIZE_SMALL), TEXT_DIM, right,
+            "Tab / Shift+Tab: select   [ / ]: adjust   T: auto-tune   B: backend   Backspace: reset settings");
+        if let Some(error) = self.backend_error.clone() {
+            self.text(ui.len(MARGIN), y + ui.len(self.tuning_height() - 24), ui.px(SIZE_SMALL), TEXT_BODY, right, &error);
+        }
+    }
+
     /// Key hints along the bottom edge.
     fn draw_footer(&mut self) {
         let ui = self.ui();
@@ -1189,6 +1289,38 @@ mod tests {
     use crate::subpixel::SubpixelPixel;
 
     #[test]
+    fn attached_pipeline_refreshes_grids_metrics_and_frame_revision() {
+        use crate::{coverage::Coverage, gpu::Backend, layout::SubpixelLayout, pipeline::PipelineConfig, plane::Plane, render::{csf, RenderParams}, simulate::{BleedProfile, PanelGeometry, DEFAULT_PSF_FWHM_ARCMIN}};
+        let layout = SubpixelLayout::PentileRgbg;
+        let profile = DisplayProfile::sdr_oled();
+        let config = PipelineConfig { layout, geometry: PanelGeometry::for_layout(layout), bleed: BleedProfile::oled_default(), profile: profile.clone(), simulate: true, sim_scale: 4, psf_fwhm_arcmin: DEFAULT_PSF_FWHM_ARCMIN, psf_sigma: None, chroma_cutoff_cpd: csf::CHROMA_HALF_CPD };
+        let fine = Plane::from_fn(24, 24, |x, y| if x > y { 1.0 } else { 0.0 });
+        let mut pipeline = Pipeline::new(config, Coverage::from_hi(fine.clone(), 4), fine).unwrap();
+        let tuning = Tuning { backend: Backend::Cpu, render: RenderParams::default(), viewing_distance_mm: 500.0 };
+        let out = pipeline.run(&tuning);
+        let mut inspector = Inspector::headless(InspectorConfig::default(), out.raw, out.simulated, profile).unwrap();
+        inspector.attach_pipeline(pipeline, tuning);
+        inspector.set_simulated(true);
+        inspector.update().unwrap();
+        let before = inspector.frame_state();
+        let metrics = inspector.config.metrics;
+        let note = inspector.config.simulation_note.clone();
+        inspector.tuning.as_mut().unwrap().viewing_distance_mm = 900.0;
+        inspector.refresh_tuning();
+        inspector.update().unwrap();
+        assert_ne!(before, inspector.frame_state());
+        assert_ne!(note, inspector.config.simulation_note);
+        assert_ne!(metrics, inspector.config.metrics);
+        assert!(inspector.simulate_mode);
+        assert_eq!(inspector.starting, Some(tuning));
+        let state = inspector.frame_state();
+        inspector.selected = 1;
+        assert_ne!(state, inspector.frame_state());
+        inspector.win_w = 480;
+        assert!(inspector.tuning_height() > TUNING_H);
+    }
+
+    #[test]
     fn parse_wxh_accepts_common_forms() {
         assert_eq!(parse_wxh("1920x1080"), Some((1920, 1080)));
         assert_eq!(parse_wxh("2560x1440p60"), Some((2560, 1440)));
@@ -1227,7 +1359,7 @@ mod tests {
 
     #[test]
     fn side_by_side_lays_out_three_equal_cards_inside_the_window() {
-        let cards = layout_cards(1280, 800, DisplayMode::SideBySide, Ui(1.0));
+        let cards = layout_cards(1280, 800, DisplayMode::SideBySide, Ui(1.0), TUNING_H);
         assert_eq!(cards.len(), 3);
         assert_eq!(cards.iter().map(|c| c.index).collect::<Vec<_>>(), vec![0, 1, 2]);
         for pair in cards.windows(2) {
@@ -1236,13 +1368,13 @@ mod tests {
         }
         let last = cards[2];
         assert!(last.outer.right() <= 1280 - MARGIN);
-        assert!(last.outer.y + last.outer.h <= 800 - FOOTER_H);
+        assert!(last.outer.y + last.outer.h <= 800 - FOOTER_H - TUNING_H);
         assert!(last.view.y >= last.outer.y + CARD_HEAD_H);
     }
 
     #[test]
     fn single_mode_shows_the_selected_panel_full_width() {
-        let cards = layout_cards(1280, 800, DisplayMode::OledAware, Ui(1.0));
+        let cards = layout_cards(1280, 800, DisplayMode::OledAware, Ui(1.0), TUNING_H);
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].index, 2);
         assert_eq!(cards[0].outer.w, 1280 - 2 * MARGIN);
@@ -1250,7 +1382,7 @@ mod tests {
 
     #[test]
     fn layout_survives_a_tiny_window() {
-        for card in layout_cards(10, 10, DisplayMode::SideBySide, Ui(1.5)) {
+        for card in layout_cards(10, 10, DisplayMode::SideBySide, Ui(1.5), TUNING_H) {
             assert!(card.outer.w >= 0 && card.outer.h >= 0);
             assert!(card.view.w >= 0 && card.view.h >= 0);
         }

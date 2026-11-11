@@ -310,6 +310,7 @@ fn main() {
     println!("  L           luminance-only view");
     println!("  E           auto-exposure ↔ clip (simulated view)");
     println!("  H           heatmap overlay");
+    println!("  Tab/Shift+Tab select setting; [/] adjust; T auto-tune; B backend; Backspace reset settings");
     println!("  Esc         quit");
 
     // ── Inspector window ───────────────────────────────────────────────────────
@@ -331,8 +332,10 @@ fn main() {
         ui_font: default_font().or_else(|| Some(font.clone())),
     };
 
-    let mut inspector = Inspector::new(config, output.raw, output.simulated, profile)
+    let create = if args.snapshot.is_some() { Inspector::headless } else { Inspector::new };
+    let mut inspector = create(config, output.raw, output.simulated, profile)
         .unwrap_or_else(|e| fail(format!("Failed to open inspector window: {e}")));
+    inspector.attach_pipeline(pipeline, tuning);
     if args.start_simulated {
         inspector.set_simulated(true);
     }
