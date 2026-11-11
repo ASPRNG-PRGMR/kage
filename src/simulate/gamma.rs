@@ -1,8 +1,9 @@
-//! Gamma correctness in the simulation pipeline.
+//! Gamma correctness and luminance reconstruction in the simulation pipeline.
 //!
 //! This module documents and enforces the linear-light requirement for
-//! all simulation operations, and provides diagnostic helpers for
-//! detecting accidental signal-domain inputs.
+//! all simulation operations, provides diagnostic helpers for detecting
+//! accidental signal-domain inputs, and reconstructs the luminance the
+//! viewer perceives from the coloured emitters.
 //!
 //! ## Why simulation must happen in linear light
 //!
@@ -38,7 +39,98 @@
 //! distribution (which would be suspicious for a glyph rendered on a
 //! dark background). This is a development-time check only.
 
-use crate::subpixel::SubpixelGrid;
+use crate::subpixel::{SubpixelGrid, SubpixelPixel};
+
+// ── Luminance reconstruction ──────────────────────────────────────────────────
+//
+// Sharpness is carried almost entirely by luminance; the eye resolves colour
+// at a much lower spatial frequency. So the question "how crisp does this
+// glyph look on this panel?" is a question about the luminance image the
+// coloured emitters add up to — and that sum is only meaningful in linear
+// light, where light from separate emitters adds.
+//
+// Gamma-aware order of operations:
+//
+//   linear RGB ──▶ Y = 0.2126 R + 0.7152 G + 0.0722 B ──▶ EOTF encode ──▶ display
+//
+// Computing Y from *encoded* R'G'B' (video "luma") understates the
+// contribution of saturated emitters and is wrong for this purpose.
+
+/// Luminance weights for linear-light R, G, B with sRGB / Rec. 709 primaries
+/// and a D65 white point. They sum to 1.0, so white has luminance 1.0.
+pub const LUMA_WEIGHTS: [f32; 3] = [0.2126, 0.7152, 0.0722];
+
+/// Relative luminance of a **linear-light** pixel.
+#[inline]
+pub fn relative_luminance(px: SubpixelPixel) -> f32 {
+    LUMA_WEIGHTS[0] * px.r + LUMA_WEIGHTS[1] * px.g + LUMA_WEIGHTS[2] * px.b
+}
+
+/// Reconstruct the luminance image of a **linear-light** grid.
+///
+/// Returns an achromatic grid (`r = g = b = Y`) of the same size, still in
+/// linear light: pass it through [`crate::render::encode_grid`] to display it.
+/// Works on per-pixel grids and on oversampled emission maps alike.
+pub fn reconstruct_luminance(grid: &SubpixelGrid) -> SubpixelGrid {
+    let mut out = SubpixelGrid::new(grid.width, grid.height);
+    for row in 0..grid.height {
+        for col in 0..grid.width {
+            let y = relative_luminance(grid.pixel(col, row));
+            *out.pixel_mut(col, row) = SubpixelPixel { r: y, g: y, b: y };
+        }
+    }
+    out
+}
+
+/// RMS difference in luminance between two **linear-light** grids.
+///
+/// Measures how faithfully `candidate` reproduces the luminance of
+/// `reference` — e.g. a simulated panel image against the intended coverage.
+/// Returns `None` if the grids differ in size or are empty.
+pub fn luminance_rms_error(reference: &SubpixelGrid, candidate: &SubpixelGrid) -> Option<f32> {
+    if reference.width != candidate.width
+        || reference.height != candidate.height
+        || reference.width == 0
+        || reference.height == 0
+    {
+        return None;
+    }
+    let mut acc = 0.0f64;
+    for row in 0..reference.height {
+        for col in 0..reference.width {
+            let d = relative_luminance(reference.pixel(col, row))
+                - relative_luminance(candidate.pixel(col, row));
+            acc += (d * d) as f64;
+        }
+    }
+    let n = (reference.width * reference.height) as f64;
+    Some((acc / n).sqrt() as f32)
+}
+
+/// RMS chromatic residue of a **linear-light** grid: how far each channel
+/// strays from the pixel's own luminance.
+///
+/// Zero for an achromatic image. For white-on-black text any nonzero value
+/// is colour the glyph was not supposed to have, so this is a direct measure
+/// of fringing. Returns 0.0 for an empty grid.
+pub fn chroma_rms(grid: &SubpixelGrid) -> f32 {
+    let n = (grid.width * grid.height) as f64;
+    if n == 0.0 {
+        return 0.0;
+    }
+    let mut acc = 0.0f64;
+    for row in 0..grid.height {
+        for col in 0..grid.width {
+            let px = grid.pixel(col, row);
+            let y = relative_luminance(px);
+            let (dr, dg, db) = (px.r - y, px.g - y, px.b - y);
+            acc += ((dr * dr + dg * dg + db * db) / 3.0) as f64;
+        }
+    }
+    (acc / n).sqrt() as f32
+}
+
+// ── Linear-light guard ────────────────────────────────────────────────────────
 
 /// Heuristic check that a grid looks like linear light, not sRGB signal.
 ///
@@ -125,6 +217,7 @@ pub fn viewing_distance_to_sigma(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::Eotf;
     use crate::subpixel::{SubpixelGrid, SubpixelPixel};
 
     #[test]
@@ -173,5 +266,112 @@ mod tests {
         let s = viewing_distance_to_sigma(0.254, 500.0, 0.5);
         assert!(s > 0.0 && s < 2.0,
             "sigma should be small fraction of a pixel for typical panel: {s}");
+    }
+
+    // ── Luminance reconstruction ──────────────────────────────────────────
+
+    fn filled(w: u32, h: u32, px: SubpixelPixel) -> SubpixelGrid {
+        let mut g = SubpixelGrid::new(w, h);
+        for row in 0..h {
+            for col in 0..w {
+                *g.pixel_mut(col, row) = px;
+            }
+        }
+        g
+    }
+
+    #[test]
+    fn luma_weights_sum_to_one() {
+        let sum: f32 = LUMA_WEIGHTS.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn grey_luminance_is_its_own_value() {
+        let px = SubpixelPixel { r: 0.37, g: 0.37, b: 0.37 };
+        assert!((relative_luminance(px) - 0.37).abs() < 1e-6);
+    }
+
+    #[test]
+    fn green_dominates_luminance() {
+        let lum = |r, g, b| relative_luminance(SubpixelPixel { r, g, b });
+        assert!(lum(0.0, 1.0, 0.0) > lum(1.0, 0.0, 0.0));
+        assert!(lum(1.0, 0.0, 0.0) > lum(0.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn reconstruct_luminance_is_achromatic_and_same_size() {
+        let g = filled(3, 2, SubpixelPixel { r: 1.0, g: 0.5, b: 0.0 });
+        let y = reconstruct_luminance(&g);
+        assert_eq!((y.width, y.height), (3, 2));
+        let expected = 0.2126 + 0.7152 * 0.5;
+        for row in 0..2 {
+            for col in 0..3 {
+                let p = y.pixel(col, row);
+                assert!((p.r - expected).abs() < 1e-6);
+                assert!(p.r == p.g && p.g == p.b);
+            }
+        }
+    }
+
+    #[test]
+    fn reconstruction_is_gamma_aware() {
+        // Luminance is summed in linear light and encoded afterwards:
+        // linear Y of (0.5, 0.5, 0.5) is 0.5, which encodes to ~0.735 —
+        // not to the 0.5 a signal-domain average would give.
+        let eotf = Eotf::Srgb;
+        let y = relative_luminance(SubpixelPixel { r: 0.5, g: 0.5, b: 0.5 });
+        let displayed = eotf.encode(y);
+        assert!((displayed - 0.7354).abs() < 0.01, "got {displayed}");
+
+        // And for a saturated pixel, luma computed on encoded values is
+        // measurably different from encoded true luminance.
+        let px = SubpixelPixel { r: 0.2, g: 0.0, b: 0.0 };
+        let correct = eotf.encode(relative_luminance(px));
+        let naive = LUMA_WEIGHTS[0] * eotf.encode(px.r);
+        assert!((correct - naive).abs() > 0.05, "correct={correct} naive={naive}");
+    }
+
+    #[test]
+    fn luminance_error_is_zero_for_identical_grids() {
+        let g = filled(4, 4, SubpixelPixel { r: 0.3, g: 0.6, b: 0.9 });
+        assert_eq!(luminance_rms_error(&g, &g), Some(0.0));
+    }
+
+    #[test]
+    fn luminance_error_ignores_pure_chroma_differences() {
+        // Same luminance, different colour → zero luminance error.
+        let grey = filled(2, 2, SubpixelPixel { r: 0.5, g: 0.5, b: 0.5 });
+        // Shift red up and blue down so that 0.2126·dr + 0.0722·db = 0.
+        let dr = 0.1;
+        let db = -dr * LUMA_WEIGHTS[0] / LUMA_WEIGHTS[2];
+        let tinted = filled(2, 2, SubpixelPixel { r: 0.5 + dr, g: 0.5, b: 0.5 + db });
+        let err = luminance_rms_error(&grey, &tinted).unwrap();
+        assert!(err < 1e-5, "err={err}");
+        assert!(chroma_rms(&tinted) > 0.05);
+    }
+
+    #[test]
+    fn luminance_error_measures_brightness_difference() {
+        let a = filled(2, 2, SubpixelPixel { r: 0.5, g: 0.5, b: 0.5 });
+        let b = filled(2, 2, SubpixelPixel { r: 0.7, g: 0.7, b: 0.7 });
+        let err = luminance_rms_error(&a, &b).unwrap();
+        assert!((err - 0.2).abs() < 1e-5, "err={err}");
+    }
+
+    #[test]
+    fn luminance_error_rejects_mismatched_sizes() {
+        let a = SubpixelGrid::new(2, 2);
+        let b = SubpixelGrid::new(3, 2);
+        assert_eq!(luminance_rms_error(&a, &b), None);
+    }
+
+    #[test]
+    fn chroma_is_zero_for_grey_and_positive_for_colour() {
+        let grey = filled(3, 3, SubpixelPixel { r: 0.4, g: 0.4, b: 0.4 });
+        assert!(chroma_rms(&grey) < 1e-6);
+        let red = filled(3, 3, SubpixelPixel { r: 1.0, g: 0.0, b: 0.0 });
+        assert!(chroma_rms(&red) > 0.3);
+        assert_eq!(chroma_rms(&SubpixelGrid::new(0, 0)), 0.0);
     }
 }

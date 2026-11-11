@@ -52,7 +52,10 @@ pub mod panel;
 pub mod psf;
 
 pub use bleed::BleedProfile;
-pub use gamma::{check_linear, viewing_distance_to_sigma, DEFAULT_PSF_FWHM_ARCMIN};
+pub use gamma::{
+    check_linear, chroma_rms, luminance_rms_error, reconstruct_luminance, relative_luminance,
+    viewing_distance_to_sigma, DEFAULT_PSF_FWHM_ARCMIN, LUMA_WEIGHTS,
+};
 pub use panel::{emit, integrate_pixels, Emitter, EmitterChannel, PanelGeometry};
 pub use psf::{convolve_separable, gaussian_kernel, kernel_radius};
 
