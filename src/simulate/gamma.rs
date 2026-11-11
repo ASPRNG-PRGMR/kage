@@ -78,22 +78,31 @@ pub fn check_linear(grid: &SubpixelGrid, label: &str) -> bool {
     ok
 }
 
-/// Scale factor to convert a viewing distance and pixel pitch to a PSF sigma.
+/// Default angular PSF width (FWHM, arcminutes) used when deriving sigma from
+/// viewing distance.
+///
+/// The optical PSF of a well-focused human eye is roughly 1–2 arcminutes FWHM.
+/// 1.7 arcmin maps to sigma ≈ 0.45 px on a 109 dpi panel viewed from 500 mm,
+/// which is the documented KAGE default.
+pub const DEFAULT_PSF_FWHM_ARCMIN: f32 = 1.7;
+
+/// Convert an angular PSF width at the eye into a PSF sigma in panel pixels.
 ///
 /// Given:
 /// - `pixel_pitch_mm`: physical size of one pixel in millimetres
 /// - `viewing_distance_mm`: distance from eye to panel in millimetres
-/// - `psf_fwhm_arcmin`: desired PSF Full Width at Half Maximum in arcminutes
+/// - `psf_fwhm_arcmin`: PSF Full Width at Half Maximum in arcminutes,
+///   measured as an angle at the viewer's eye
 ///
 /// Returns the PSF sigma in pixel units.
 ///
-/// ## Background
+/// ## Scaling
 ///
-/// The human eye's optical PSF at normal viewing distance is roughly
-/// 1–2 arcminutes FWHM. The panel's optical PSF is much smaller — for
-/// OLED at typical pixel densities (~100–250 ppi) it's a fraction of
-/// one pixel. We use a PSF FWHM of ~0.5 arcminutes at 500mm viewing
-/// distance as a reasonable starting point.
+/// The PSF is a fixed *angle*, so the patch of panel it covers grows with
+/// distance: `fwhm_mm = fwhm_rad × viewing_distance_mm`.  Doubling the viewing
+/// distance therefore doubles sigma in pixel units (each pixel subtends half
+/// the angle, so the eye merges twice as many of them).  Likewise a denser
+/// panel (smaller pitch) gives a larger sigma in pixels.
 ///
 /// `sigma = FWHM / (2 * sqrt(2 * ln(2)))` ≈ FWHM / 2.355
 pub fn viewing_distance_to_sigma(
@@ -134,13 +143,28 @@ mod tests {
 
     #[test]
     fn viewing_distance_sigma_scaling() {
-        // Doubling viewing distance should halve the sigma in pixel units.
+        // The PSF is a fixed angle at the eye, so doubling the viewing
+        // distance doubles the sigma in pixel units.
         let pitch = 0.27;
         let fwhm = 0.5;
         let s1 = viewing_distance_to_sigma(pitch, 500.0, fwhm);
         let s2 = viewing_distance_to_sigma(pitch, 1000.0, fwhm);
-        assert!((s2 / s1 - 0.5).abs() < 0.01,
-            "sigma should halve with doubled viewing distance: s1={s1} s2={s2}");
+        assert!((s2 / s1 - 2.0).abs() < 0.01,
+            "sigma should double with doubled viewing distance: s1={s1} s2={s2}");
+    }
+
+    #[test]
+    fn finer_pitch_gives_larger_sigma_in_pixels() {
+        let coarse = viewing_distance_to_sigma(0.30, 500.0, 1.0);
+        let fine = viewing_distance_to_sigma(0.15, 500.0, 1.0);
+        assert!((fine / coarse - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn default_fwhm_matches_documented_sigma() {
+        // 109 dpi, 500 mm, default FWHM → the documented ~0.45 px.
+        let s = viewing_distance_to_sigma(25.4 / 109.0, 500.0, DEFAULT_PSF_FWHM_ARCMIN);
+        assert!((s - 0.45).abs() < 0.01, "expected ~0.45 px, got {s}");
     }
 
     #[test]

@@ -15,7 +15,7 @@ use kage::{
     layout::SubpixelLayout,
     profile::DisplayProfile,
     render::{render, RenderMode},
-    simulate::{simulate, SimulationParams},
+    simulate::{simulate, SimulationParams, DEFAULT_PSF_FWHM_ARCMIN},
     viz::Inspector,
 };
 
@@ -72,6 +72,11 @@ struct Args {
     /// Ignored if --psf-sigma is set.
     #[arg(long, default_value_t = 500.0)]
     viewing_dist: f32,
+
+    /// PSF width (FWHM) in arcminutes at the viewer's eye, used with
+    /// --viewing-dist to derive the PSF sigma. Ignored if --psf-sigma is set.
+    #[arg(long, default_value_t = DEFAULT_PSF_FWHM_ARCMIN)]
+    psf_fwhm: f32,
 }
 
 fn parse_layout(s: &str) -> SubpixelLayout {
@@ -108,7 +113,7 @@ fn main() {
             p.sigma = sigma;
             p
         } else {
-            SimulationParams::from_viewing_distance(&profile, args.viewing_dist, 0.5)
+            SimulationParams::from_viewing_distance(&profile, args.viewing_dist, args.psf_fwhm)
         }
     } else {
         SimulationParams::identity()

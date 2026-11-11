@@ -13,16 +13,20 @@
 //!
 //! # Physical parameterisation
 //!
-//! Sigma is derived from the panel's pixel pitch and the viewing distance:
+//! Sigma is derived from the panel's pixel pitch, the viewing distance, and
+//! the angular width of the PSF at the viewer's eye
+//! (see [`super::gamma::viewing_distance_to_sigma`]):
 //!
 //! ```text
-//! angular_pixel = pixel_pitch_mm / viewing_distance_mm   (radians, small-angle)
-//! sigma_pixels  = psf_fwhm / (2√(2 ln 2))               (FWHM → sigma conversion)
+//! fwhm_mm      = fwhm_radians × viewing_distance_mm     (small-angle)
+//! fwhm_pixels  = fwhm_mm / pixel_pitch_mm
+//! sigma_pixels = fwhm_pixels / (2√(2 ln 2))             (FWHM → sigma)
 //! ```
 //!
-//! A typical SDR OLED at 50 cm viewing distance and 0.27 mm pixel pitch gives
-//! sigma ≈ 0.4–0.6 pixels, producing a subtle but physically meaningful blur.
-//! Increasing viewing distance decreases the apparent PSF width.
+//! A 109 dpi panel (0.233 mm pitch) at 50 cm with a 1.7 arcmin PSF gives
+//! sigma ≈ 0.45 pixels — a subtle but physically meaningful blur.  Because the
+//! PSF is a fixed angle, sigma *in pixels* grows with viewing distance and
+//! with pixel density.
 //!
 //! # Correctness requirement
 //!

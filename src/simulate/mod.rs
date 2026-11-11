@@ -36,7 +36,7 @@ pub mod gamma;
 pub mod psf;
 
 pub use bleed::BleedProfile;
-pub use gamma::{check_linear, viewing_distance_to_sigma};
+pub use gamma::{check_linear, viewing_distance_to_sigma, DEFAULT_PSF_FWHM_ARCMIN};
 pub use psf::{convolve_separable, gaussian_kernel, kernel_radius};
 
 use crate::profile::DisplayProfile;
@@ -100,7 +100,8 @@ impl SimulationParams {
     ///
     /// - `profile.dpi` is used to compute pixel pitch
     /// - `viewing_distance_mm` is the eye-to-panel distance
-    /// - `psf_fwhm_arcmin` is the desired PSF width in arcminutes
+    /// - `psf_fwhm_arcmin` is the PSF width in arcminutes at the eye
+    ///   (see [`DEFAULT_PSF_FWHM_ARCMIN`])
     pub fn from_viewing_distance(
         profile: &DisplayProfile,
         viewing_distance_mm: f32,
