@@ -5,7 +5,7 @@
 
 ![KAGE inspector: one glyph antialiased three ways](docs/inspector-raw.png)
 
-*The inspector: one glyph antialiased three ways for a Pentile RGBG panel. Press `S` to see the same glyph as the physical panel would emit it:*
+*The inspector: one glyph antialiased three ways for a Pentile RGBG panel. The OLED-aware panel looks the most coloured here, and that is the point — press `S` to see the same three as the physical panel would emit them:*
 
 ![KAGE inspector: simulated panel view](docs/inspector-simulated.png)
 
@@ -38,15 +38,15 @@ This project explores a third path: **display-aware perceptual text reconstructi
 
 ## Current Status
 
-**Phases 1, 1.5 and 2 are complete.** The rendering sandbox, the zoomable inspector and the display simulator (physical subpixel placement, optical blur, luminance reconstruction) are implemented and tested.
+**Phases 1 to 3 are complete.** The rendering sandbox, the zoomable inspector, the display simulator and the OLED-aware renderer (each colour sampled at its emitter, from supersampled coverage) are implemented and tested. Phase 4 (GPU backends, live tuning) is specified in [`phase4.md`](phase4.md).
 
 | Phase | Status | Description |
 |-------|--------|-------------|
 | **Phase 1** | ✅ Complete | Rendering sandbox + zoomable inspector |
 | **Phase 1.5** | ✅ Complete | Pipeline refactor — renderers return linear light |
 | **Phase 2** | ✅ Complete | Physical subpixel geometry, optical PSF blur, per-channel bleed, luminance reconstruction |
-| **Phase 3** | 🔲 Next | Experimental rendering: luma/chroma decoupling, frequency-aware |
-| **Phase 4** | 🔲 Planned | GPU acceleration (OpenGL → Vulkan) |
+| **Phase 3** | ✅ Complete | Emitter-position sampling on every layout, supersampled coverage, CSF-based metric and auto-tuning, panel files |
+| **Phase 4** | 🔲 Next | GPU acceleration (OpenGL, Vulkan), live tuning UI — see [`phase4.md`](phase4.md) |
 
 ---
 
@@ -123,9 +123,48 @@ cargo run --release -- --glyph g --snapshot frame.ppm
 | `--psf-fwhm <arcmin>` | 1.7 | Angular width of the PSF at the eye |
 | `--sim-scale <n>` | 6 | Emission-map samples per pixel per axis (1–16) |
 | `--dpi`, `--dpr` | 109, 1.0 | Panel density; also drives the HiDPI greyscale fallback |
-| `--no-fringe` | off | Disable adaptive fringe suppression in the OLED-Aware panel |
 
-The CLI also prints two numbers per rendering mode: **luminance error** (RMS difference between the simulated image, integrated back to pixels, and the intended coverage) and **chroma residue** (RMS colour in what the viewer sees — fringing, for white-on-black text).
+### The OLED-aware renderer
+
+```bash
+# Use a panel description instead of a built-in layout
+cargo run --release -- --panel layouts/delta-rgb.toml --glyph g
+
+# Search for the best footprints for this glyph, panel and distance
+cargo run --release -- --layout delta --glyph g --auto-tune
+
+# Set them by hand
+cargo run --release -- --luma-footprint 0.8 --chroma-footprint 1.3 --edge-suppression 0.5
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--panel <file>` | — | Panel description (`.toml`): emitter geometry, bleed, layout. See [`layouts/README.md`](layouts/README.md) |
+| `--supersample <n>` | 4 | Coverage samples per pixel per axis given to the renderers (1–8) |
+| `--luma-footprint <px>` | 1.0 | Width sampled around each green / white emitter |
+| `--chroma-footprint <px>` | 1.0 | Width sampled around each red / blue emitter |
+| `--edge-suppression <k>` | 0 | How far red / blue move to the luma footprint at strong edges (0–1) |
+| `--auto-tune` | off | Pick the three settings above by minimising simulated error |
+| `--chroma-cutoff <cpd>` | 4 | Spatial frequency at which the eye's colour sensitivity has halved; defines "visible" fringing |
+
+### Metrics
+
+The CLI prints three numbers per rendering mode, all measured on the simulated panel image:
+
+- **Luminance error** — RMS luminance difference from what an ideal display would show: the glyph rasterized at the simulation's resolution, seen through the same optical blur. The reference has the glyph's real shape between pixel centres, so placing light at the right sub-pixel position is rewarded.
+- **Visible chroma** — RMS colour left after the eye's chromatic low-pass. This is fringing. The inspector shows it as "Colour fringing".
+- **Chroma residue** — RMS of all colour, including the pixel-scale emitter pattern the eye averages to grey.
+
+Glyph `g` at 20 px, 109 DPI, viewed from 500 mm (nominal panel geometries):
+
+| Layout | Mode | Luminance error | Visible chroma |
+|--------|------|-----------------|----------------|
+| Pentile RGBG | Greyscale / Subpixel / **OLED-aware** | 0.085 / 0.109 / **0.062** | 0.031 / 0.027 / **0.011** |
+| RGB stripe | Greyscale / Subpixel / **OLED-aware** | 0.069 / 0.091 / **0.062** | 0.029 / 0.021 / **0.007** |
+| Delta RGB | Greyscale / Subpixel / **OLED-aware** | 0.077 / 0.085 / **0.056** | 0.030 / 0.024 / **0.008** |
+| WRGB | Greyscale / Subpixel / **OLED-aware** | 0.078 / 0.078 / **0.064** | 0.004 / 0.004 / 0.004 |
+
+These are simulator results on nominal geometry, not measurements of real panels or of readers.
 
 ### Inspector controls
 
@@ -146,7 +185,7 @@ The CLI also prints two numbers per rendering mode: **luminance error** (RMS dif
 
 The window has a normal title bar, so it can be maximised, tiled or closed like any other. On Wayland desktops KAGE opens through XWayland to get one, because the windowing library draws no title bar of its own on compositors such as GNOME; set `KAGE_BACKEND=wayland` to use the native backend instead.
 
-The window explains itself: a header says what is on screen and which view is active, each panel has a title and a one-line description of its rendering strategy, and the footer lists the controls. Interface text scales up with the window, and long lines wrap rather than run off the edge. The glyph opens fitted to the panel and stays fitted until you zoom or pan — including when the window is maximised. At zoom ≥ 8× faint lines mark pixel boundaries. The heatmap mode (`H`) false-colours the image to make R/B channel imbalance visible — useful for measuring fringing. In the simulated view each panel's heading also shows its luminance error and colour fringing.
+The window explains itself: a header says what is on screen and which view is active, each panel has a title and a one-line description of its rendering strategy, and the footer lists the controls. Interface text scales up with the window, and long lines wrap rather than run off the edge. The glyph opens fitted to the panel and stays fitted until you zoom or pan — including when the window is maximised. At zoom ≥ 8× faint lines mark pixel boundaries. The heatmap mode (`H`) false-colours the image to make R/B channel imbalance visible. In the simulated view each panel's heading also shows its luminance error and colour fringing (visible chroma).
 
 In the simulated view each logical pixel is drawn from its individual emitters, so zooming in shows the real subpixel structure. The simulated image is luminance-preserving, which makes bare emitters brighter than 1.0; auto-exposure (on by default) scales all three panels by one common factor so they stay comparable, and `E` switches to clipping instead.
 
@@ -156,41 +195,66 @@ In the simulated view each logical pixel is drawn from its individual emitters, 
 
 ```
 font::loader::FontFace
-      │  FreeType rasterization → GlyphBitmap (u8 grey or LCD)
+      │  FreeType rasterization, at pixel resolution and N× finer
       ▼
-glyph::GlyphBuffer          [R, G, B, A: f32]  linear light, width×height×4
+coverage::Coverage          lo: 1 sample / pixel     hi: N×N samples / pixel   (linear area coverage)
       │
-      ├──▶ render::grayscale    ──┐
-      ├──▶ render::subpixel_aa  ──┤──▶ SubpixelGrid (linear light, 1 sample / pixel)
-      └──▶ render::oled_aware   ──┘         │
-                                            ├───────────────────────────┐
-                                            │                  simulate::simulate_panel()
-                                            │                    panel::emit()   emitters at physical positions
-                                            │                    psf + bleed     per-channel Gaussian blur
-                                            │                           │
-                                            │              SubpixelGrid (linear light, N×N samples / pixel)
-                                            ▼                           ▼
+      ├──▶ render::grayscale    lo copied to R, G, B              ──┐
+      ├──▶ render::subpixel_aa  lo through a fixed 3×3 kernel     ──┤──▶ SubpixelGrid (linear light, 1 RGB / pixel)
+      └──▶ render::oled_aware   hi averaged over a footprint      ──┘         │
+                                centred on each emitter                        │
+                                (positions from PanelGeometry)                 │
+                                            ┌──────────────────────────────────┤
+                                            │                     simulate::simulate_panel()
+                                            │                       panel::emit()   emitters at physical positions
+                                            │                       psf + bleed     per-channel Gaussian blur
+                                            │                              │
+                                            │                 SubpixelGrid (linear light, S×S samples / pixel)
+                                            │                              │──▶ metrics vs simulate_ideal(coverage at S×)
+                                            ▼                              ▼
                                     viz::Inspector   S toggles raw ↔ simulated
                                       (luminance) → (exposure) → render::encode_grid()   ← EOTF applied once
                                              │
                                         framebuffer
 ```
 
-Everything upstream of `encode_grid()` is linear light. Filtering, blur and luminance sums are only physically meaningful there.
+`pipeline::Pipeline` runs this chain. Everything upstream of `encode_grid()` is linear light. Filtering, blur and luminance sums are only physically meaningful there.
+
+### How the OLED-aware renderer works
+
+A pixel's three colours do not come from the same place. If all three are given the same value (greyscale), a white pixel at the left edge of a stem shows red further left than blue, and the edge is tinted. That mismatch is colour fringing.
+
+The OLED-aware renderer does not filter pixel values. For every colour of every pixel it asks where that colour's emitter sits on this panel, and takes the mean of the glyph's supersampled coverage over a footprint centred there. Each emitter then shows the part of the glyph that is actually in front of it. The raw RGB looks coloured; the light it produces is not.
+
+- **Every layout, one code path.** Emitter positions come from the panel geometry (`layout::EmitterMap`), built-in or loaded from a `.toml` file. RGB/BGR stripe, Pentile RGBG and Delta RGB differ only in that data.
+- **WRGB.** The panel routes white through its white emitter, an eighth of a pixel left of centre, so all channels are sampled there: luminance is reconstructed where it is emitted.
+- **Frequency-aware.** Coverage is rasterized 4× finer than the pixel grid, so detail between pixel centres reaches the emitters instead of being averaged away first.
+- **Luma / chroma decoupling.** Green and white emitters carry luminance, red and blue mostly colour, and the eye resolves luminance much more finely. The two groups have separate footprint widths.
+- **Edge-aware chroma suppression.** Where the coverage has a strong edge (2-D Sobel) along an axis in which this panel's colours are displaced, red and blue move to the luminance footprint.
+- **Matched to the eye.** `--auto-tune` searches those settings for the lowest luminance error plus *visible* chroma, where visible means surviving the chromatic contrast-sensitivity low-pass at the current viewing distance.
+
+At the default viewing conditions the sweep found one-pixel footprints for all colours and no edge suppression to be at or within about 2 % of the best setting on every built-in layout, so those are the defaults. Narrower luma footprints do win for individual glyphs and at larger sizes (try `--auto-tune`).
 
 ### Key data types
 
 | Type | Location | Description |
 |------|----------|-------------|
 | `GlyphBuffer` | `src/glyph.rs` | Linear-light RGBA f32 pixel buffer |
+| `Plane` | `src/plane.rs` | Single-channel f32 image, clamp-to-edge sampling |
+| `Coverage` | `src/coverage.rs` | Glyph coverage at pixel resolution and supersampled |
 | `GlyphBitmap` | `src/font/loader.rs` | Raw FreeType bitmap (u8, grey or LCD) |
 | `FontFace` | `src/font/loader.rs` | FreeType face with pixel size set |
 | `SubpixelLayout` | `src/layout/mod.rs` | Enum of known panel geometries |
-| `SubpixelGrid` | `src/subpixel/grid.rs` | Per-pixel (R,G,B) energy after layout filtering |
+| `FilterKernel` / `BaseFilter` | `src/layout/mod.rs` | Fixed 3×3 taps per colour channel; which one a layout uses |
+| `EmitterMap` | `src/layout/emitters.rs` | Emitter position per colour per pixel of the unit cell |
+| `SubpixelGrid` | `src/subpixel/grid.rs` | Per-pixel (R,G,B) energy after rendering |
+| `RenderParams` | `src/render/perceptual.rs` | OLED-aware settings: footprints, edge suppression |
 | `DisplayProfile` | `src/profile.rs` | EOTF, white point, DPI, DPR |
 | `RenderMode` | `src/render/mod.rs` | Greyscale / SubpixelAa / OledAware |
 | `PanelGeometry` | `src/simulate/panel.rs` | Unit cell of emitters: position, aperture, colour |
+| `PanelDescription` | `src/simulate/panel_file.rs` | A panel loaded from `.toml` |
 | `SimulationParams` | `src/simulate/mod.rs` | PSF sigma and per-channel bleed |
+| `Pipeline` / `Tuning` | `src/pipeline.rs` | Glyph → renderers → simulation → metrics; auto-tune |
 | `ViewSet` | `src/viz/inspector.rs` | The three modes' grids at one pipeline stage |
 | `Inspector` | `src/viz/inspector.rs` | minifb window, zoom/pan/heatmap/simulate |
 
@@ -204,29 +268,31 @@ Flat `[R, G, B, A: f32]` buffer in linear light (before EOTF encoding). The alph
 ### `src/profile.rs` — `DisplayProfile`
 Describes the physical display: EOTF (sRGB, Gamma, PQ), white point (D65, DCI-P3), DPI, and device pixel ratio. `is_hidpi()` returns true at ≥192 effective DPI, triggering greyscale fallback. `sdr_oled()` constructs a sensible default for typical Samsung OLED monitors.
 
-### `src/layout/mod.rs` — `SubpixelLayout`
-Enum of panel geometries: `RgbStripe`, `BgrStripe`, `PentileRgbg`, `DeltaRgb`, `Wrgb`, `Greyscale`. `subpixel_rendering_useful()` returns false for WRGB and Greyscale (chromatic penalty exceeds gain). `channel_weights(col_parity, row_parity)` returns per-channel presence weights for layout-aware filtering.
+### `src/plane.rs`, `src/coverage.rs` — `Plane`, `Coverage`
+`Plane` is a scalar image whose reads clamp to the edge. `Coverage` holds a glyph twice: `lo`, one sample per pixel, and `hi`, `scale × scale` samples per pixel, with `lo` the box average of `hi`. `Coverage::rasterize()` draws both from a `FontFace`; `sample_box()` averages `hi` over a rectangle at any sub-pixel position. Coverage is linear area coverage — no transfer function is applied.
 
-### `src/layout/pentile.rs` — Pentile RGBG geometry
-Every pixel is `[R G]` or `[B G]`, red and blue alternating in a checkerboard. FIR kernel constants (`GREEN_FIR`, `RED_FIR`, `BLUE_FIR`), `filter_row()` applying them, `chromatic_penalty()` computing the normalised discrete Laplacian, and `adaptive_blend()` lerping between subpixel and greyscale outputs.
+### `src/layout/` — layouts, kernels, emitter positions
+- `mod.rs` — `SubpixelLayout` (`RgbStripe`, `BgrStripe`, `PentileRgbg`, `DeltaRgb`, `Wrgb`, `Greyscale`), `FilterKernel` (separable 3×3 taps per channel) and `BaseFilter` (which kernel a layout's Subpixel AA baseline uses).
+- `pentile.rs` — Pentile RGBG taps (`GREEN_FIR`, `RED_FIR`, `BLUE_FIR`, `ABSENT_FIR`) and the Phase 1 row filter and Laplacian penalty.
+- `delta.rs` — Delta-RGB 2-D kernel: each channel interpolated at its emitter's offset, horizontally and vertically.
+- `emitters.rs` — `EmitterMap::from_geometry()`: the area-weighted centroid of each colour's emitters in each pixel of the unit cell (up to 2×2). Panels with a white emitter map all three channels to it.
 
 ### `src/font/loader.rs` — `FontFace`, `GlyphBitmap`
-FreeType-backed loader. `rasterize_grey()` produces 8-bit greyscale coverage. `rasterize_lcd()` produces 3-byte-per-pixel RGB subpixel output (FreeType's built-in LCD filter applied). `GlyphBitmap::into_glyph_buffer()` converts to linear-light `GlyphBuffer` via sRGB EOTF decode.
+FreeType-backed loader. `rasterize_grey()` produces 8-bit coverage; `rasterize_grey_scaled(ch, n)` draws the same hinted outline on a grid `n` times finer; `rasterize_lcd()` produces FreeType's own LCD-filtered output.
 
 ### `src/subpixel/grid.rs` — `SubpixelGrid`
-Virtual subpixel grid. `from_glyph(buf, layout, fringe_suppress)` applies the layout-appropriate filter row by row. `to_argb8_display()` packs into `Vec<u32>` for minifb. The RGB stripe path uses a 3-tap phase-shifted FIR. Pentile uses `layout::pentile::filter_row()` plus optional `adaptive_blend()`. Both filters clamp to the edge, so every column is written whatever the glyph width.
+One RGB value per logical pixel. `from_coverage(plane, filter)` applies a fixed kernel; `from_glyph(buf, layout, fringe_suppress)` is the Phase 1 entry point and still offers the Laplacian blend on Pentile. All filters clamp to the edge, so every column is written whatever the glyph width.
 
 ### `src/render/` — Three rendering strategies
 
-| Module | Strategy | Fringe suppression |
-|--------|----------|--------------------|
-| `grayscale.rs` | All channels = coverage, linear light | N/A |
-| `subpixel_aa.rs` | Layout FIR applied, linear light | No |
-| `oled_aware.rs` | Layout FIR + adaptive blend, linear light | Yes |
+| Module | Strategy | Input |
+|--------|----------|-------|
+| `grayscale.rs` | All channels = coverage | pixel coverage |
+| `subpixel_aa.rs` | Fixed kernel per layout (stripe phase shift, Pentile FIR, Delta 2-D) — the baseline | pixel coverage |
+| `oled_aware.rs` + `perceptual.rs` | Footprint average at each emitter | supersampled coverage + `EmitterMap` |
+| `csf.rs` | Luminance and chromatic contrast-sensitivity models, and the Gaussian widths derived from them | — |
 
-All three return **linear-light** grids. All three auto-fall-back to greyscale on HiDPI or WRGB layouts. `encode_grid()` in `render/mod.rs` is the single point where EOTF encoding happens, called by the inspector immediately before display.
-
-Fringe suppression is currently implemented for Pentile RGBG only, so on RGB/BGR stripe the Subpixel AA and OLED-Aware outputs are identical. Delta-RGB has no 2-D kernel yet and renders as greyscale in both subpixel modes (Phase 3).
+All renderers return **linear-light** grids and fall back to greyscale on HiDPI panels. Subpixel AA is also greyscale on WRGB. `render_coverage()` is the dispatch that takes a `Coverage`; `render()` is the convenience form for a `GlyphBuffer`. `encode_grid()` is the single point where EOTF encoding happens.
 
 ### `src/simulate/` — Display simulation
 
@@ -235,10 +301,11 @@ Fringe suppression is currently implemented for Pentile RGBG only, so on RGB/BGR
 | `panel.rs` | `PanelGeometry`: emitters per unit cell. `emit()` paints a grid onto an oversampled emission map; `integrate_pixels()` goes back to one value per pixel |
 | `psf.rs` | Gaussian kernel builder and separable convolution, with clamp or black borders |
 | `bleed.rs` | `BleedProfile`: per-channel sigma multipliers (red 1.20, green 1.00, blue 1.10) |
-| `gamma.rs` | Viewing distance → sigma, linear-light guard, luminance reconstruction, luminance-error and chroma metrics |
-| `mod.rs` | `SimulationParams`, `simulate()` (per-pixel blur only), `simulate_panel()` (emitters + blur) |
+| `panel_file.rs` | `PanelDescription`: geometry, bleed and layout from a `.toml` file |
+| `gamma.rs` | Viewing distance → sigma, linear-light guard, luminance reconstruction, luminance-error, chroma and visible-chroma metrics |
+| `mod.rs` | `SimulationParams`, `simulate()` (per-pixel blur only), `simulate_panel()` (emitters + blur), `simulate_ideal()` (the metrics' reference) |
 
-**Panel geometries.** `PanelGeometry::for_layout()` returns a preset for each `SubpixelLayout`. The presets encode each layout's *topology* — which emitters exist, their order and relative placement — with **nominal** aperture sizes. They are not measurements of a particular panel. `PanelGeometry` is plain public data in logical-pixel units, so values measured from a datasheet or a macro photo can be supplied directly (divide micrometres by the pixel pitch).
+**Panel geometries.** `PanelGeometry::for_layout()` returns a preset for each `SubpixelLayout`. The presets encode each layout's *topology* — which emitters exist, their order and relative placement — with **nominal** aperture sizes. They are not measurements of a particular panel. Measured values go in a panel file (`--panel`, format in [`layouts/README.md`](layouts/README.md)), in pixels or micrometres; the files shipped in `layouts/` reproduce the nominal presets as templates.
 
 | Layout | Unit cell | Emitters |
 |--------|-----------|----------|
@@ -251,6 +318,9 @@ Fringe suppression is currently implemented for Pentile RGBG only, so on RGB/BGR
 **Energy.** Emission is luminance-preserving: each emitter is driven brighter than the pixel value by the inverse of its channel's fill factor, so a white field integrates back to white on every layout.
 
 **Blur.** Sigma is in logical pixels. It comes from `--psf-sigma`, or from a fixed angular PSF at the eye: `sigma_px = (fwhm_rad × distance / pitch) / 2.355`. Because the PSF is an angle, sigma in pixels grows with viewing distance and with pixel density. The simulated image has the glyph bitmap's extent; blur that would land outside it is dropped.
+
+### `src/pipeline.rs` — `Pipeline`
+Owns the glyph coverage, the panel and the profile; `run(&Tuning)` renders the three modes, simulates and scores them, caching what a settings change does not affect. `auto_tune()` is a coordinate descent over footprint widths and edge suppression that minimises luminance error plus visible chroma.
 
 ### `src/viz/inspector.rs` — `Inspector`
 minifb window with a header, three titled panels and a key-hint footer; zoom (1–64×), pan, single-panel and side-by-side modes, a raw ↔ simulated toggle, a luminance-only view, and a false-colour heatmap overlay for channel imbalance analysis. It holds linear-light `ViewSet`s, re-encodes only when the view changes, and redraws only when something on screen changes.
@@ -288,17 +358,18 @@ Draws the inspector's own interface text: glyphs rasterized through `FontFace`, 
 - [x] Inspector: raw ↔ simulated toggle, luminance view, exposure control
 - [x] Luminance-error and chroma-residue metrics printed per rendering mode
 
-### Phase 3 — Experimental Rendering Techniques 🔲
-- [ ] Luma/chroma decoupling (sharpen luma, suppress chroma at edges)
-- [ ] Edge-aware chroma suppression beyond the current Laplacian approximation
-- [ ] Frequency-aware rendering (preserve high-frequency luminance detail)
-- [ ] Perceptual filtering matched to human contrast sensitivity function (CSF)
-- [ ] Delta-RGB (QD-OLED) 2-D kernel (currently falls back to greyscale)
-- [ ] WRGB white-channel luminance reconstruction
-- [ ] Fringe suppression for RGB/BGR stripe (currently Pentile only)
-- [ ] Measured per-panel geometries and bleed, loaded from `.toml`
+### Phase 3 — Experimental Rendering Techniques ✅
+- [x] Luma/chroma decoupling — separate footprints for luminance-carrying (G, W) and colour-carrying (R, B) emitters
+- [x] Edge-aware chroma suppression beyond the Laplacian — 2-D Sobel, weighted by the axes the panel fringes in
+- [x] Frequency-aware rendering — supersampled coverage sampled at emitter positions
+- [x] Perceptual filtering matched to the CSF — chromatic-CSF visible-chroma metric; `--auto-tune` minimises it with luminance error
+- [x] Delta-RGB (QD-OLED) 2-D kernel — `src/layout/delta.rs`
+- [x] WRGB white-channel luminance reconstruction — sampled at the white emitter
+- [x] Fringe suppression for RGB/BGR stripe — same emitter-sampling path as every other layout
+- [x] Per-panel geometry and bleed loaded from `.toml` — `--panel`, `layouts/` (the loader is done; the shipped files are nominal, no measured panel data exists yet)
 
 ### Phase 4 — GPU Acceleration 🔲
+Specified in [`phase4.md`](phase4.md).
 - [ ] OpenGL rendering backend
 - [ ] GLSL fragment shader implementations of all three render modes
 - [ ] Vulkan compute shader backend
@@ -315,9 +386,9 @@ Draws the inspector's own interface text: glyphs rasterized through `FontFace`, 
 | Font loading & rasterization | `freetype` crate (FreeType 2) |
 | Windowing / framebuffer | `minifb` (software, no GPU) |
 | CLI | `clap` v4 (derive API) |
-| Rendering — Phases 1–2 | CPU software renderer |
-| Rendering — Phase 3+ | OpenGL + GLSL shaders |
-| Rendering — Phase 4 | Vulkan + compute shaders |
+| Panel files | `toml` + `serde` |
+| Rendering — Phases 1–3 | CPU software renderer |
+| Rendering — Phase 4 | OpenGL fragment shader, Vulkan compute shader |
 
 ---
 
@@ -329,38 +400,48 @@ kage/
 │   ├── main.rs                    # CLI entry point (clap), event loop
 │   ├── lib.rs                     # Crate root, module declarations
 │   ├── glyph.rs                   # GlyphBuffer — linear-light RGBA f32 buffer
+│   ├── plane.rs                   # Plane — single-channel image, Gaussian blur
+│   ├── coverage.rs                # Coverage — pixel + supersampled glyph coverage
+│   ├── pipeline.rs                # Pipeline — render, simulate, score, auto-tune
 │   ├── profile.rs                 # DisplayProfile — EOTF, white point, DPI
 │   ├── font/
 │   │   ├── mod.rs                 # Re-exports FontFace
-│   │   └── loader.rs              # FreeType loader, GlyphBitmap → GlyphBuffer
+│   │   └── loader.rs              # FreeType loader, scaled rasterization
 │   ├── layout/
-│   │   ├── mod.rs                 # SubpixelLayout enum, channel_weights()
-│   │   └── pentile.rs             # Pentile RGBG FIR kernels, chromatic_penalty()
+│   │   ├── mod.rs                 # SubpixelLayout, FilterKernel, BaseFilter
+│   │   ├── pentile.rs             # Pentile RGBG taps, chromatic_penalty()
+│   │   ├── delta.rs               # Delta-RGB 2-D kernel
+│   │   └── emitters.rs            # EmitterMap — emitter positions per pixel
 │   ├── subpixel/
 │   │   ├── mod.rs                 # Re-exports SubpixelGrid, SubpixelPixel
-│   │   └── grid.rs                # Layout-aware filtering → SubpixelGrid (linear light)
+│   │   └── grid.rs                # SubpixelGrid, fixed-kernel filtering
 │   ├── render/
-│   │   ├── mod.rs                 # RenderMode enum, render() dispatch, encode_grid()
-│   │   ├── grayscale.rs           # Greyscale AA renderer (returns linear light)
-│   │   ├── subpixel_aa.rs         # ClearType-style subpixel renderer (returns linear light)
-│   │   └── oled_aware.rs          # OLED-aware renderer (returns linear light)
+│   │   ├── mod.rs                 # RenderMode, render(), render_coverage(), encode_grid()
+│   │   ├── grayscale.rs           # Greyscale AA renderer
+│   │   ├── subpixel_aa.rs         # Fixed-kernel subpixel renderer (baseline)
+│   │   ├── oled_aware.rs          # OLED-aware renderer, GlyphBuffer entry points
+│   │   ├── perceptual.rs          # Emitter-position sampling, RenderParams
+│   │   └── csf.rs                 # Contrast-sensitivity models
 │   ├── simulate/
-│   │   ├── mod.rs                 # SimulationParams, simulate(), simulate_panel()
+│   │   ├── mod.rs                 # SimulationParams, simulate_panel(), simulate_ideal()
 │   │   ├── panel.rs               # PanelGeometry, emit(), integrate_pixels()
+│   │   ├── panel_file.rs          # PanelDescription — .toml panel files
 │   │   ├── psf.rs                 # Gaussian kernels, separable convolution
 │   │   ├── bleed.rs               # Per-channel bleed profile
-│   │   └── gamma.rs               # Sigma from viewing distance, luminance reconstruction, metrics
+│   │   └── gamma.rs               # Sigma from viewing distance, luminance, metrics
 │   └── viz/
 │       ├── mod.rs                 # Re-exports Inspector, ViewSet
 │       ├── inspector.rs           # minifb window: header, panels, zoom, pan, raw/simulated views
 │       └── text.rs                # Text drawing for the inspector's interface
+├── layouts/                       # Panel description files (.toml) and their format
 ├── docs/                          # Screenshots used in this README
 ├── Cargo.toml
 ├── devlog.md
+├── phase4.md                      # Specification for Phase 4
 └── README.md
 ```
 
-Planned but not yet present: `layouts/` (custom `.toml` panel definitions) and `shaders/` + `src/gpu/` (Phase 4).
+Planned but not yet present: `shaders/` and `src/gpu/` (Phase 4).
 
 ---
 

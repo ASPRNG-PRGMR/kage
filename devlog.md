@@ -619,3 +619,68 @@ Verified: the X11 window reports a 37 px top frame extent (`_NET_FRAME_EXTENTS`)
 
 110 unit tests pass.
 
+
+---
+
+## Session 14 — Phase 3: sampling at the emitter
+**Date:** 2026-11-11
+
+Phase 3's checklist assumed the way to improve on subpixel AA was to post-process it: split pixels into luma and chroma, sharpen one, suppress the other at edges. That was built first, measured in the simulator, and dropped. What replaced it works on every layout.
+
+### What was tried and did not work
+
+1. **Pixel-level chroma suppression** (`C − k·LP(C)`, plus a Sobel edge term, on the output of the Phase 1 kernels). Averaged over 24 glyphs on an RGB stripe, visible chroma in the simulated image went *up*, from 0.011 to 0.016. Restoring luminance detail from the pixel coverage raised it further.
+2. **The same in a "displayed" domain** (predict what reaches each pixel centre with mirrored kernels, correct that, map the correction back). Neutral: 0.0112 without chroma suppression, 0.0117 with.
+
+The reason is the same in both. On a real panel the three colours of a pixel are in different places, and that displacement is the dominant source of fringing: greyscale rendering, which has no pixel-level colour at all, had the *most* visible chroma on every colour layout. The colour a subpixel filter puts into pixel values is what cancels it. Treating that colour as the error removes the cure.
+
+### What was built
+
+**Sample each colour where its emitter is.** For every colour of every pixel, take the mean of the glyph's coverage over a footprint centred on that colour's emitter (`render::perceptual::render_at_emitters`).
+
+- `layout::EmitterMap` derives the positions from `PanelGeometry` — the same data the simulator draws — for unit cells up to 2×2. Stripe, Pentile and Delta-RGB are one code path. On WRGB all channels map to the white emitter.
+- `coverage::Coverage` carries the glyph at pixel resolution and N× finer (default 4). `FontFace::rasterize_grey_scaled` applies `FT_Set_Transform` after hinting, so the fine raster is the same hinted shape and box-averages back to the pixel bitmap.
+- Two footprint widths (green/white vs red/blue) and an edge term that moves red/blue to the luma footprint at strong edges (2-D Sobel, weighted by the axes in which the panel's colours are displaced).
+- `Subpixel AA` keeps the fixed kernels as the baseline, and gains a Delta-RGB 2-D kernel (`layout/delta.rs`) where it used to fall back to greyscale. All fixed kernels are now one type, `FilterKernel`.
+
+**Measure against the real glyph.** The old luminance error compared pixel sums with pixel coverage, which cannot see sub-pixel position. `simulate_ideal` shows the glyph rasterized at the simulation's resolution through the same optics; luminance error is now the per-sample RMS against that. `visible_chroma_rms` low-passes the simulated chroma at the chromatic CSF cutoff before measuring.
+
+**Tune against the simulator.** `Pipeline::auto_tune` is a coordinate descent over the three settings minimising luminance error + visible chroma.
+
+**Panel files.** `--panel file.toml` loads geometry, bleed and layout (`simulate/panel_file.rs`), in pixels or micrometres. `layouts/` has the five presets as templates and a README.
+
+### Results
+
+40 glyph/size combinations (10 glyphs × 12, 16, 20, 28 px), 109 DPI, 500 mm, nominal geometry, 4× supersampling. Luminance error / visible chroma:
+
+| Layout | Greyscale | Subpixel AA | OLED-aware (1 / 1 / 0) |
+|--------|-----------|-------------|------------------------|
+| RGB stripe | 0.064 / 0.027 | 0.089 / 0.015 | 0.057 / 0.007 |
+| Pentile RGBG | 0.081 / 0.031 | 0.107 / 0.025 | 0.057 / 0.014 |
+| Delta RGB | 0.070 / 0.029 | 0.078 / 0.015 | 0.055 / 0.009 |
+| WRGB | 0.073 / 0.003 | 0.073 / 0.003 | 0.061 / 0.003 |
+
+A grid search over luma footprint 0.4–1.2, chroma footprint 0.5–2.5 and edge suppression 0/0.5/1 improved the summed objective by at most 1.6 % over 1 / 1 / 0 on any layout (best: 0.9/1.0/0 Pentile, 0.9/1.0/1 Delta, 0.9/0.5/0 WRGB). So the defaults are one-pixel footprints and no edge suppression everywhere: the footprint split and the edge term are implemented and tunable, but at these viewing conditions they are not what delivers the improvement — emitter positioning and supersampling are. Single glyphs at larger sizes do tune away from the default (Delta-RGB `A` at 64 px: 0.8 / 0.5 / 0).
+
+### Behaviour changes to know about
+
+- **Coverage is linear.** The pipeline no longer sRGB-decodes FreeType's coverage bytes. Area coverage is a linear quantity, and the fine and coarse rasters only agree if it is treated as one. Glyphs are heavier than in Phase 2 output. `GlyphBitmap::into_glyph_buffer` still decodes, for callers of the old API.
+- **Metric values are not comparable with Phase 2's**: the reference changed.
+- `--no-fringe` is a hidden alias for `--edge-suppression 0`.
+- `PanelGeometry::name` is a `String`.
+
+### Verification
+
+176 unit tests pass, including one asserting that the OLED-aware mode has lower luminance error and lower visible chroma than both baselines on RGB, BGR, Pentile and Delta (and lower luminance error on WRGB) for a synthetic stroke. Each of the five commits builds and passes its own tests. Both views were captured with `--snapshot` and checked by eye; the README screenshots are regenerated.
+
+### Limits
+
+- All numbers come from the simulator with nominal geometry and nominal bleed. No panel has been measured and no reader has been tested.
+- The shipped panel files are the presets; the loader has only been exercised on them and on unit-test input.
+- Unit cells larger than 2×2 are rejected by the renderer.
+- Footprints are one pixel tall on every layout.
+- The CSF curves are textbook approximations; the luminance CSF is defined but only the chromatic one is used.
+
+### Phase 4
+
+Not started on `main`. `phase4.md` specifies it. The two GPU backends were prototyped and verified against the CPU renderers before the phase was put on hold; they are on the branch `phase4-gpu-backends`.
