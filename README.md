@@ -3,6 +3,12 @@
 
 > A programmable experimental text rendering engine and display simulator for improving text clarity on modern OLED displays with non-standard subpixel layouts (WOLED, Pentile, Triangular).
 
+![KAGE inspector: one glyph antialiased three ways](docs/inspector-raw.png)
+
+*The inspector: one glyph antialiased three ways for a Pentile RGBG panel. Press `S` to see the same glyph as the physical panel would emit it:*
+
+![KAGE inspector: simulated panel view](docs/inspector-simulated.png)
+
 ---
 
 ## Why This Project Exists
@@ -89,23 +95,29 @@ cargo run --release -- \
 # On macOS:                     /Library/Fonts/Arial.ttf
 ```
 
-### Run the display simulation
+### The display simulation
+
+The panel simulation (emitters at their physical positions, then optical blur) is computed on every run. Press `S` in the inspector to toggle raw ↔ simulated.
 
 ```bash
-# Simulate the panel: emitters at their physical positions, then optical blur.
-# Press S in the inspector to toggle raw ↔ simulated.
-cargo run --release -- --glyph g --layout pentile --simulate
+# Open directly in the simulated view
+cargo run --release -- --glyph g --layout pentile --start-simulated
 
 # Bare emitters, no blur — see the subpixel structure itself
-cargo run --release -- --glyph g --simulate --psf-sigma 0
+cargo run --release -- --glyph g --psf-sigma 0 --start-simulated
 
 # Blur derived from viewing distance (mm) and panel DPI
-cargo run --release -- --glyph g --simulate --viewing-dist 700 --dpi 140
+cargo run --release -- --glyph g --viewing-dist 700 --dpi 140
+
+# Save the first frame as an image and exit
+cargo run --release -- --glyph g --snapshot frame.ppm
 ```
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--simulate` | off | Build the simulated panel image |
+| `--no-simulate` | off | Skip the simulation (it is on by default) |
+| `--start-simulated` | off | Open in the simulated view |
+| `--snapshot <file>` | — | Write the first frame to a PPM image and exit |
 | `--psf-sigma <px>` | derived | Blur sigma in logical pixels; `0` disables blur. Overrides the two flags below |
 | `--viewing-dist <mm>` | 500 | Eye-to-panel distance |
 | `--psf-fwhm <arcmin>` | 1.7 | Angular width of the PSF at the eye |
@@ -113,28 +125,26 @@ cargo run --release -- --glyph g --simulate --viewing-dist 700 --dpi 140
 | `--dpi`, `--dpr` | 109, 1.0 | Panel density; also drives the HiDPI greyscale fallback |
 | `--no-fringe` | off | Disable adaptive fringe suppression in the OLED-Aware panel |
 
-With `--simulate` the CLI also prints two numbers per rendering mode: **luminance error** (RMS difference between the simulated image, integrated back to pixels, and the intended coverage) and **chroma residue** (RMS colour in what the viewer sees — fringing, for white-on-black text).
+The CLI also prints two numbers per rendering mode: **luminance error** (RMS difference between the simulated image, integrated back to pixels, and the intended coverage) and **chroma residue** (RMS colour in what the viewer sees — fringing, for white-on-black text).
 
 ### Inspector controls
 
 | Input | Action |
 |-------|--------|
 | Scroll wheel | Zoom in / out, anchored to cursor position |
-| `+` / `=` | Zoom in (keyboard) |
-| `-` | Zoom out (keyboard) |
+| `+` / `=`, `-` | Zoom in / out (keyboard) |
 | Click + drag | Pan |
 | Arrow keys | Pan by one pixel |
-| `1` | Greyscale AA only |
-| `2` | Subpixel AA (ClearType-style) only |
-| `3` | OLED-Aware only |
-| `A` | Side-by-side comparison (default) |
-| `S` | Toggle raw render ↔ simulated panel (needs `--simulate`) |
+| `R` | Reset: fit the glyph to the panel |
+| `1` `2` `3` | Show one panel: Greyscale AA / Subpixel AA / OLED-Aware |
+| `A` | All three side by side (default) |
+| `S` | Toggle raw render ↔ simulated panel |
 | `L` | Toggle luminance-only view |
 | `E` | Simulated view: auto-exposure ↔ clip |
 | `H` | Toggle per-channel heatmap overlay |
 | `Esc` | Quit |
 
-The window title shows which view is active. The default view is **side-by-side**: Greyscale AA | Subpixel AA | OLED-Aware, left to right. At zoom ≥ 8× individual pixel grid lines are drawn. The heatmap mode (`H`) false-colours the image to make R/B channel imbalance visible — useful for measuring fringing.
+The window explains itself: a header says what is on screen and which view is active, each panel has a title and a one-line description of its rendering strategy, and the footer lists the controls. The glyph opens fitted to the panel and stays fitted until you zoom or pan. At zoom ≥ 8× faint lines mark pixel boundaries. The heatmap mode (`H`) false-colours the image to make R/B channel imbalance visible — useful for measuring fringing. In the simulated view each panel's heading also shows its luminance error and colour fringing.
 
 In the simulated view each logical pixel is drawn from its individual emitters, so zooming in shows the real subpixel structure. The simulated image is luminance-preserving, which makes bare emitters brighter than 1.0; auto-exposure (on by default) scales all three panels by one common factor so they stay comparable, and `E` switches to clipping instead.
 
@@ -241,7 +251,10 @@ Fringe suppression is currently implemented for Pentile RGBG only, so on RGB/BGR
 **Blur.** Sigma is in logical pixels. It comes from `--psf-sigma`, or from a fixed angular PSF at the eye: `sigma_px = (fwhm_rad × distance / pitch) / 2.355`. Because the PSF is an angle, sigma in pixels grows with viewing distance and with pixel density. The simulated image has the glyph bitmap's extent; blur that would land outside it is dropped.
 
 ### `src/viz/inspector.rs` — `Inspector`
-minifb window with zoom (1–64×), pan, three single-panel views, side-by-side mode, a raw ↔ simulated toggle, a luminance-only view, and a false-colour heatmap overlay for channel imbalance analysis. It holds linear-light `ViewSet`s and re-encodes only when the view changes. At zoom ≥ 8× a pixel grid is drawn over the zoomed output. The label strip uses colour-coded accent bars (blue = greyscale, orange = subpixel AA, green = OLED-aware).
+minifb window with a header, three titled panels and a key-hint footer; zoom (1–64×), pan, single-panel and side-by-side modes, a raw ↔ simulated toggle, a luminance-only view, and a false-colour heatmap overlay for channel imbalance analysis. It holds linear-light `ViewSet`s, re-encodes only when the view changes, and redraws only when something on screen changes.
+
+### `src/viz/text.rs` — `TextRenderer`
+Draws the inspector's own interface text: glyphs rasterized through `FontFace`, cached per size and blended in linear light. Uses the system default font. At zoom ≥ 8× a pixel grid is drawn over the zoomed output. The label strip uses colour-coded accent bars (blue = greyscale, orange = subpixel AA, green = OLED-aware).
 
 ---
 
@@ -337,7 +350,9 @@ kage/
 │   │   └── gamma.rs               # Sigma from viewing distance, luminance reconstruction, metrics
 │   └── viz/
 │       ├── mod.rs                 # Re-exports Inspector, ViewSet
-│       └── inspector.rs           # minifb window: zoom, pan, heatmap, raw/simulated views
+│       ├── inspector.rs           # minifb window: header, panels, zoom, pan, raw/simulated views
+│       └── text.rs                # Text drawing for the inspector's interface
+├── docs/                          # Screenshots used in this README
 ├── Cargo.toml
 ├── devlog.md
 └── README.md

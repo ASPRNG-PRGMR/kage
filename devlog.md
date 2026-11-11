@@ -565,3 +565,31 @@ Emission is luminance-preserving: radiance = pixel value ÷ the channel's fill f
 - `BleedProfile` multipliers and all aperture sizes are nominal.
 - Scroll direction on Wayland is still unconfirmed; the debug-build diagnostic print remains.
 
+---
+
+## Session 12 — Inspector interface overhaul
+**Date:** 2026-11-11
+
+The inspector showed three unlabelled images with coloured bars. Someone opening it had no way to tell what they were looking at.
+
+### What changed
+
+- **Text.** New `src/viz/text.rs`: interface text rasterized through the engine's own `FontFace`, cached per size, blended in linear light. It always uses the system default font, since the font under test may not contain Latin letters.
+- **Header.** Project name and tagline, the glyph / font / size, a sentence describing what is on screen (it changes between the raw and simulated views), and chips for the active view and zoom.
+- **Panels.** Each rendering mode is a card with an accent colour, a title and a one-line description of the strategy. In the simulated view the heading also shows that mode's luminance error and colour fringing.
+- **Footer.** Key hints.
+- **Viewport.** The glyph opens centred and fitted, and stays fitted through window resizes until the user zooms or pans (`R` restores it). The checkerboard background is gone; the glyph bitmap gets a thin outline. Pixel grid lines are a faint lightening instead of opaque lines that overwrote the data.
+- **Scroll direction inverted**, as requested. The debug-build scroll diagnostic is removed now that the axis handling is confirmed.
+- **Simulation is on by default** (`--no-simulate` to skip), so `S` always works. `--simulate` is still accepted.
+- `--start-simulated` opens in the simulated view; `--snapshot <file>` writes the first frame to a PPM and exits. The README screenshots were made this way.
+
+### Internals
+
+- The view position is stored as the logical point at the centre of the viewport (`center_x`, `center_y`, f32) rather than an integer pan offset. Zoom anchoring, dragging and re-layout on resize all become one-liners and sub-pixel exact.
+- Frames are redrawn only when `FrameState` changes; an idle window just re-presents the buffer.
+- `Inspector::new` takes an `InspectorConfig` (titles, notes, metrics, UI font).
+
+### Verification
+
+105 unit tests pass. Both views were captured with `--snapshot` and checked. Scroll direction, drag and the key toggles were not exercised by hand.
+
