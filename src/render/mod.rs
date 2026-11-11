@@ -13,21 +13,30 @@
 //!                               framebuffer / simulate module
 //! ```
 //!
+//! The greyscale and subpixel renderers apply a fixed kernel to
+//! pixel-resolution coverage ([`BaseFilter`], chosen by [`base_filter`]).
+//! The OLED-aware renderer instead samples supersampled coverage at each
+//! emitter's position ([`perceptual`]), controlled by [`RenderParams`].
+//!
 //! EOTF encoding is intentionally kept out of the individual renderers.
 //! All filtering, blending, and display simulation (`crate::simulate`)
 //! must operate in linear light.  The caller applies [`encode_grid`] as
 //! the final step before writing to a u8 framebuffer.
 
+pub mod csf;
 pub mod grayscale;
-pub mod subpixel_aa;
 pub mod oled_aware;
+pub mod perceptual;
+pub mod subpixel_aa;
 
 pub use grayscale::render_grayscale;
+pub use oled_aware::{render_oled_aware, render_oled_aware_with};
+pub use perceptual::{render_at_emitters, RenderParams};
 pub use subpixel_aa::render_subpixel;
-pub use oled_aware::render_oled_aware;
 
+use crate::coverage::Coverage;
 use crate::glyph::GlyphBuffer;
-use crate::layout::SubpixelLayout;
+use crate::layout::{BaseFilter, EmitterMap, SubpixelLayout};
 use crate::profile::DisplayProfile;
 use crate::subpixel::SubpixelGrid;
 
@@ -36,13 +45,15 @@ use crate::subpixel::SubpixelGrid;
 pub enum RenderMode {
     /// Greyscale antialiasing — all channels equal, no subpixel colour.
     Greyscale,
-    /// Standard ClearType-style horizontal subpixel AA.
+    /// Fixed-kernel subpixel AA on pixel-resolution coverage.
     SubpixelAa,
-    /// OLED-aware rendering with layout-matched FIR and adaptive fringe suppression.
+    /// Supersampled coverage sampled at each emitter's position.
     OledAware,
 }
 
 impl RenderMode {
+    pub const ALL: [RenderMode; 3] = [RenderMode::Greyscale, RenderMode::SubpixelAa, RenderMode::OledAware];
+
     pub fn label(&self) -> &'static str {
         match self {
             RenderMode::Greyscale  => "Greyscale AA",
@@ -52,20 +63,66 @@ impl RenderMode {
     }
 }
 
-/// Dispatch to the correct renderer.
+/// The fixed kernel `mode` applies to pixel-resolution coverage on `layout`
+/// for a panel described by `profile`.
+///
+/// Greyscale mode and HiDPI panels always get [`BaseFilter::Grey`]. For
+/// [`RenderMode::OledAware`] this is only the fallback kernel: that mode
+/// samples at emitter positions unless [`samples_at_emitters`] says no.
+pub fn base_filter(mode: RenderMode, layout: SubpixelLayout, profile: &DisplayProfile) -> BaseFilter {
+    if mode == RenderMode::Greyscale || profile.is_hidpi() {
+        return BaseFilter::Grey;
+    }
+    BaseFilter::for_layout(layout)
+}
+
+/// Whether `mode` samples at emitter positions on this panel. On a HiDPI
+/// panel the emitters are too fine for it to matter, and every mode falls
+/// back to greyscale.
+pub fn samples_at_emitters(mode: RenderMode, profile: &DisplayProfile) -> bool {
+    mode == RenderMode::OledAware && !profile.is_hidpi()
+}
+
+/// Dispatch to the correct renderer, with [`RenderParams::for_layout`] and
+/// the layout's nominal emitter positions.
+///
+/// `buf` holds pixel-resolution coverage; use [`render_coverage`] to give
+/// the OLED-aware renderer supersampled coverage.
 ///
 /// Returns a **linear-light** [`SubpixelGrid`].  Call [`encode_grid`] before
-/// writing to a framebuffer or passing to the simulate module.
+/// writing to a framebuffer.
 pub fn render(
     buf: &GlyphBuffer,
     mode: RenderMode,
     layout: SubpixelLayout,
     profile: &DisplayProfile,
 ) -> SubpixelGrid {
-    match mode {
-        RenderMode::Greyscale  => render_grayscale(buf, profile),
-        RenderMode::SubpixelAa => render_subpixel(buf, layout, profile),
-        RenderMode::OledAware  => render_oled_aware(buf, layout, profile),
+    render_coverage(
+        &Coverage::from_glyph(buf),
+        mode,
+        layout,
+        &EmitterMap::for_layout(layout),
+        profile,
+        &RenderParams::for_layout(layout),
+    )
+}
+
+/// Dispatch to the correct renderer.
+///
+/// `layout` selects the fixed kernel of the Subpixel AA mode; `map` gives
+/// the emitter positions and `params` the settings of the OLED-aware mode.
+pub fn render_coverage(
+    cov: &Coverage,
+    mode: RenderMode,
+    layout: SubpixelLayout,
+    map: &EmitterMap,
+    profile: &DisplayProfile,
+    params: &RenderParams,
+) -> SubpixelGrid {
+    if samples_at_emitters(mode, profile) {
+        render_at_emitters(cov, map, params)
+    } else {
+        SubpixelGrid::from_coverage(&cov.lo, base_filter(mode, layout, profile))
     }
 }
 
@@ -105,6 +162,38 @@ mod tests {
             }
         }
         buf
+    }
+
+    #[test]
+    fn base_filter_follows_mode_layout_and_density() {
+        let profile = DisplayProfile::sdr_oled();
+        let mut hidpi = profile.clone();
+        hidpi.device_pixel_ratio = 2.0;
+        use SubpixelLayout::*;
+        assert_eq!(base_filter(RenderMode::Greyscale, PentileRgbg, &profile), BaseFilter::Grey);
+        assert_eq!(base_filter(RenderMode::SubpixelAa, PentileRgbg, &profile), BaseFilter::Pentile);
+        assert_eq!(base_filter(RenderMode::SubpixelAa, DeltaRgb, &profile), BaseFilter::Delta);
+        assert_eq!(base_filter(RenderMode::SubpixelAa, Wrgb, &profile), BaseFilter::Grey);
+        assert_eq!(base_filter(RenderMode::SubpixelAa, RgbStripe, &hidpi), BaseFilter::Grey);
+        assert!(samples_at_emitters(RenderMode::OledAware, &profile));
+        assert!(!samples_at_emitters(RenderMode::OledAware, &hidpi));
+        assert!(!samples_at_emitters(RenderMode::SubpixelAa, &profile));
+    }
+
+    #[test]
+    fn render_coverage_uses_the_fine_plane_only_in_oled_mode() {
+        use crate::plane::Plane;
+        // Edge at x = 2.25: invisible at pixel resolution beyond lo = 0.75.
+        let cov = Coverage::from_hi(Plane::from_fn(24, 8, |x, _| if x >= 9 { 1.0 } else { 0.0 }), 4);
+        let profile = DisplayProfile::sdr_oled();
+        let layout = SubpixelLayout::RgbStripe;
+        let map = EmitterMap::for_layout(layout);
+        let params = RenderParams::default();
+        let grey = render_coverage(&cov, RenderMode::Greyscale, layout, &map, &profile, &params);
+        assert!((grey.pixel(2, 1).g - 0.75).abs() < 1e-6);
+        let oled = render_coverage(&cov, RenderMode::OledAware, layout, &map, &profile, &params);
+        let px = oled.pixel(2, 1);
+        assert!(px.r < px.g && px.g < px.b, "{px:?}");
     }
 
     #[test]

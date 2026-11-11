@@ -1,27 +1,32 @@
-//! Standard ClearType-style horizontal subpixel antialiasing.
+//! Fixed-kernel subpixel antialiasing on pixel-resolution coverage.
+//!
+//! Each colour channel is filtered with a small kernel chosen per layout
+//! ([`crate::layout::BaseFilter`]). On an RGB stripe this is the classic
+//! ClearType-style phase shift; Pentile and Delta-RGB have their own
+//! kernels. It is the baseline the OLED-aware renderer is compared with.
 //!
 //! Returns a **linear-light** [`SubpixelGrid`].  The caller applies
 //! [`crate::render::encode_grid`] before writing to a framebuffer.
 
+use super::{base_filter, RenderMode};
 use crate::glyph::GlyphBuffer;
 use crate::layout::SubpixelLayout;
+use crate::plane::Plane;
 use crate::profile::DisplayProfile;
 use crate::subpixel::SubpixelGrid;
 
-/// Render `buf` using standard subpixel antialiasing for `layout`.
+/// Render `buf` using subpixel antialiasing for `layout`.
 ///
-/// No fringe suppression is applied.  Output is in **linear light**.
+/// No fringe suppression is applied.  Output is in **linear light**. Falls
+/// back to greyscale on HiDPI panels and on layouts where colour subpixel
+/// rendering has no benefit (WRGB).
 pub fn render_subpixel(
     buf: &GlyphBuffer,
     layout: SubpixelLayout,
     profile: &DisplayProfile,
 ) -> SubpixelGrid {
-    if !layout.subpixel_rendering_useful() || profile.is_hidpi() {
-        return super::grayscale::render_grayscale(buf, profile);
-    }
-
-    // Layout filter applied, fringe suppression OFF. Returns linear light.
-    SubpixelGrid::from_glyph(buf, layout, false)
+    let filter = base_filter(RenderMode::SubpixelAa, layout, profile);
+    SubpixelGrid::from_coverage(&Plane::from_coverage(buf), filter)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

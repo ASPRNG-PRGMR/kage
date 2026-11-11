@@ -1,42 +1,52 @@
-//! OLED-aware renderer — layout-matched FIR + adaptive fringe suppression.
+//! OLED-aware renderer — each colour sampled where its emitter sits.
 //!
 //! Returns a **linear-light** [`SubpixelGrid`].  The caller applies
 //! [`crate::render::encode_grid`] before writing to a framebuffer.
 //!
-//! # Fringe suppression strategy
+//! The method is described in [`crate::render::perceptual`]. In short:
+//! instead of filtering pixel values with a fixed kernel, every colour of
+//! every pixel takes the mean of the glyph's supersampled coverage over a
+//! footprint centred on that colour's emitter, with separate footprint
+//! widths for luminance-carrying and colour-carrying emitters.
 //!
-//! The chromatic penalty is the normalised discrete Laplacian of the coverage
-//! signal (see [`crate::layout::pentile::chromatic_penalty`]).  It peaks at
-//! hard step edges and approaches zero in smooth regions.
-//!
-//! At each pixel:
-//! ```text
-//! out = lerp(subpixel_rgb, greyscale, penalty)
-//! ```
-//!
-//! Smooth strokes get full subpixel sharpness; hard edges collapse toward
-//! colour-neutral greyscale to suppress chromatic fringing.
+//! The functions here are the convenience entry points that start from a
+//! [`GlyphBuffer`], i.e. pixel-resolution coverage, where a shifted
+//! footprint can only interpolate between neighbouring pixels. For
+//! supersampled coverage use [`crate::render::render_coverage`].
 
+use super::perceptual::{render_at_emitters, RenderParams};
+use super::{samples_at_emitters, RenderMode};
+use crate::coverage::Coverage;
 use crate::glyph::GlyphBuffer;
-use crate::layout::SubpixelLayout;
+use crate::layout::{EmitterMap, SubpixelLayout};
 use crate::profile::DisplayProfile;
 use crate::subpixel::SubpixelGrid;
 
-/// Render `buf` using OLED-aware subpixel antialiasing.
+/// Render `buf` with the OLED-aware renderer and the layout's tuned
+/// settings ([`RenderParams::for_layout`]).
 ///
-/// Fringe suppression is always enabled on this path.  Output is in
-/// **linear light** — apply [`crate::render::encode_grid`] before display.
+/// Output is in **linear light** — apply [`crate::render::encode_grid`]
+/// before display.
 pub fn render_oled_aware(
     buf: &GlyphBuffer,
     layout: SubpixelLayout,
     profile: &DisplayProfile,
 ) -> SubpixelGrid {
-    if !layout.subpixel_rendering_useful() || profile.is_hidpi() {
+    render_oled_aware_with(buf, layout, profile, &RenderParams::for_layout(layout))
+}
+
+/// Render `buf` with the OLED-aware renderer and explicit settings, using
+/// the layout's nominal emitter positions.
+pub fn render_oled_aware_with(
+    buf: &GlyphBuffer,
+    layout: SubpixelLayout,
+    profile: &DisplayProfile,
+    params: &RenderParams,
+) -> SubpixelGrid {
+    if !samples_at_emitters(RenderMode::OledAware, profile) {
         return super::grayscale::render_grayscale(buf, profile);
     }
-
-    // Layout filter + fringe suppression ON. Returns linear light.
-    SubpixelGrid::from_glyph(buf, layout, true)
+    render_at_emitters(&Coverage::from_glyph(buf), &EmitterMap::for_layout(layout), params)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -52,98 +62,78 @@ mod tests {
         let mid = width / 2;
         for col in 0..width {
             let cov = if col < mid { 0.0 } else { 1.0 };
-            let px = buf.pixel_mut(col, 0);
-            px[0] = cov; px[1] = cov; px[2] = cov; px[3] = cov;
+            buf.pixel_mut(col, 0).fill(cov);
         }
         buf
     }
 
     fn uniform_buf(w: u32, h: u32, cov: f32) -> GlyphBuffer {
         let mut buf = GlyphBuffer::new(w, h);
-        for row in 0..h {
-            for col in 0..w {
-                let px = buf.pixel_mut(col, row);
-                px[0] = cov; px[1] = cov; px[2] = cov; px[3] = cov;
-            }
-        }
+        buf.pixels.fill(cov);
         buf
     }
 
     #[test]
     fn output_is_linear_not_encoded() {
-        let buf = uniform_buf(8, 1, 0.5);
+        let buf = uniform_buf(8, 2, 0.5);
         let profile = DisplayProfile::sdr_oled();
-        let grid = render_oled_aware(&buf, SubpixelLayout::PentileRgbg, &profile);
-        for col in 1..7u32 {
-            let px = grid.pixel(col, 0);
-            assert!(
-                (px.g - 0.5).abs() < 1e-4,
-                "expected linear 0.5, got {} at col {col}",
-                px.g
-            );
+        for layout in [SubpixelLayout::PentileRgbg, SubpixelLayout::DeltaRgb, SubpixelLayout::Wrgb] {
+            let grid = render_oled_aware(&buf, layout, &profile);
+            for col in 0..8u32 {
+                let px = grid.pixel(col, 0);
+                assert!((px.g - 0.5).abs() < 1e-4, "{layout:?}: expected linear 0.5, got {} at col {col}", px.g);
+            }
         }
     }
 
-    /// Fringe suppression must reduce channel spread at edges vs naive subpixel.
-    /// Both grids are now in linear light so comparison is apples-to-apples.
     #[test]
-    fn fringe_suppression_reduces_channel_spread_at_edge() {
+    fn colours_separate_at_an_edge_on_every_colour_layout() {
+        // That separation is the point: each emitter shows what is in
+        // front of it, and they are in different places.
         let buf = step_edge_buf(16);
         let profile = DisplayProfile::sdr_oled();
-
-        let oled  = render_oled_aware(&buf, SubpixelLayout::PentileRgbg, &profile);
-        let naive = super::super::subpixel_aa::render_subpixel(
-            &buf, SubpixelLayout::PentileRgbg, &profile,
-        );
-
-        let edge_col = 8u32;
-        let o = oled.pixel(edge_col, 0);
-        let n = naive.pixel(edge_col, 0);
-
-        let oled_spread  = (o.r - o.g).abs().max((o.b - o.g).abs());
-        let naive_spread = (n.r - n.g).abs().max((n.b - n.g).abs());
-
-        assert!(
-            oled_spread <= naive_spread + 1e-5,
-            "OLED-aware spread {oled_spread:.4} should be ≤ naive spread {naive_spread:.4}"
-        );
+        for layout in [SubpixelLayout::RgbStripe, SubpixelLayout::BgrStripe, SubpixelLayout::PentileRgbg, SubpixelLayout::DeltaRgb] {
+            let grid = render_oled_aware_with(&buf, layout, &profile, &RenderParams::default());
+            let spread = (7..=8).map(|c| { let p = grid.pixel(c, 0); (p.r - p.g).abs().max((p.b - p.g).abs()) }).fold(0.0f32, f32::max);
+            assert!(spread > 0.05, "{layout:?}: spread {spread}");
+        }
     }
 
     #[test]
-    fn no_suppression_in_smooth_region() {
-        let buf = uniform_buf(8, 1, 0.6);
+    fn stripe_orders_mirror_each_other() {
+        let buf = step_edge_buf(16);
         let profile = DisplayProfile::sdr_oled();
-
-        let oled  = render_oled_aware(&buf, SubpixelLayout::PentileRgbg, &profile);
-        let naive = super::super::subpixel_aa::render_subpixel(
-            &buf, SubpixelLayout::PentileRgbg, &profile,
-        );
-
-        for col in 1..7u32 {
-            let o = oled.pixel(col, 0);
-            let n = naive.pixel(col, 0);
-            assert!(
-                (o.r - n.r).abs() < 1e-4 && (o.g - n.g).abs() < 1e-4 && (o.b - n.b).abs() < 1e-4,
-                "smooth region mismatch at col {col}"
-            );
+        let rgb = render_oled_aware_with(&buf, SubpixelLayout::RgbStripe, &profile, &RenderParams::default());
+        let bgr = render_oled_aware_with(&buf, SubpixelLayout::BgrStripe, &profile, &RenderParams::default());
+        for col in 0..16 {
+            let (a, b) = (rgb.pixel(col, 0), bgr.pixel(col, 0));
+            assert!((a.r - b.b).abs() < 1e-6 && (a.b - b.r).abs() < 1e-6 && (a.g - b.g).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn wrgb_is_achromatic_but_not_plain_greyscale() {
+        let buf = step_edge_buf(16);
+        let profile = DisplayProfile::sdr_oled();
+        let oled = render_oled_aware_with(&buf, SubpixelLayout::Wrgb, &profile, &RenderParams::default());
+        for col in 0..16 {
+            let p = oled.pixel(col, 0);
+            assert!((p.r - p.g).abs() < 1e-6 && (p.g - p.b).abs() < 1e-6);
+        }
+        // The first lit pixel is sampled at the white emitter, an eighth of
+        // a pixel left of centre.
+        assert!((oled.pixel(8, 0).g - 0.875).abs() < 1e-6);
     }
 
     #[test]
     fn hidpi_falls_back_to_greyscale() {
-        let buf = uniform_buf(8, 4, 0.5);
+        let buf = step_edge_buf(16);
         let mut profile = DisplayProfile::sdr_oled();
         profile.device_pixel_ratio = 2.0;
-
         let grid = render_oled_aware(&buf, SubpixelLayout::PentileRgbg, &profile);
-        for row in 0..4 {
-            for col in 0..8 {
-                let px = grid.pixel(col, row);
-                assert!(
-                    (px.r - px.g).abs() < 1e-5 && (px.g - px.b).abs() < 1e-5,
-                    "HiDPI should produce greyscale at ({col},{row})"
-                );
-            }
+        for col in 0..16 {
+            let px = grid.pixel(col, 0);
+            assert!((px.r - px.g).abs() < 1e-5 && (px.g - px.b).abs() < 1e-5, "HiDPI should produce greyscale at col {col}");
         }
     }
 }
