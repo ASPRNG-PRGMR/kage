@@ -184,29 +184,18 @@ fn rgb_stripe_filter_row(
     out_right: &mut [f32],
 ) {
     let n = coverage.len();
-    if n < 3 {
-        return;
-    }
-    for i in 1..n - 1 {
-        let cl = coverage[i - 1];
+    // Taps outside the row use clamp-to-edge, so every column is written and
+    // glyphs narrower than the kernel are still filtered.
+    for i in 0..n {
+        let cl = coverage[i.saturating_sub(1)];
         let cc = coverage[i];
-        let cr = coverage[i + 1];
+        let cr = coverage[(i + 1).min(n - 1)];
         // Left-phase tap (R): emphasises left neighbour
         out_left[i]   = 0.30 * cl + 0.60 * cc + 0.10 * cr;
         // Centre tap (G): symmetric gentle sharpening
         out_centre[i] = 0.11 * cl + 0.78 * cc + 0.11 * cr;
         // Right-phase tap (B): emphasises right neighbour
         out_right[i]  = 0.10 * cl + 0.60 * cc + 0.30 * cr;
-    }
-    // Border pixels: copy coverage unfiltered
-    if n > 0 {
-        out_left[0] = coverage[0];
-        out_centre[0] = coverage[0];
-        out_right[0] = coverage[0];
-        let last = n - 1;
-        out_left[last] = coverage[last];
-        out_centre[last] = coverage[last];
-        out_right[last] = coverage[last];
     }
 }
 
@@ -277,6 +266,42 @@ mod tests {
         let argb = grid.to_argb8_display();
         for px in argb {
             assert_eq!(px, 0xFF_00_00_00);
+        }
+    }
+
+    #[test]
+    fn narrow_glyphs_are_not_black() {
+        // A 1- or 2-pixel-wide glyph must survive every subpixel layout.
+        for layout in [
+            SubpixelLayout::RgbStripe,
+            SubpixelLayout::BgrStripe,
+            SubpixelLayout::PentileRgbg,
+        ] {
+            for w in 1u32..=2 {
+                let buf = uniform_buffer(w, 3, 1.0);
+                let grid = SubpixelGrid::from_glyph(&buf, layout, true);
+                for row in 0..3 {
+                    for col in 0..w {
+                        let px = grid.pixel(col, row);
+                        assert!(
+                            (px.r - 1.0).abs() < 1e-5 && (px.g - 1.0).abs() < 1e-5 && (px.b - 1.0).abs() < 1e-5,
+                            "{layout:?} width {w} at ({col},{row}): {px:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stripe_border_columns_keep_phase_shift() {
+        // At the right edge of a solid block the border column is filtered
+        // with clamp-to-edge, so a uniform row stays uniform to the border.
+        let buf = uniform_buffer(5, 1, 0.4);
+        let grid = SubpixelGrid::from_glyph(&buf, SubpixelLayout::RgbStripe, false);
+        for col in [0u32, 4] {
+            let px = grid.pixel(col, 0);
+            assert!((px.r - 0.4).abs() < 1e-5 && (px.b - 0.4).abs() < 1e-5);
         }
     }
 }

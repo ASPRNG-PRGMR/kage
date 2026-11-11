@@ -2,53 +2,53 @@
 //!
 //! # Layout
 //!
-//! Samsung pentile RGBG arranges subpixels in a 2×2 repeating unit:
+//! Samsung pentile RGBG gives every logical pixel two emitters: a green one,
+//! plus either a red or a blue one.  Red and blue alternate in a checkerboard,
+//! so the repeating unit is 2×2 logical pixels:
 //!
 //! ```text
-//! Column:   0   1   2   3
-//! Row 0:  [ R G R G R G … ]   ← even rows: R at even cols, G at odd cols
-//! Row 1:  [ G B G B G B … ]   ← odd  rows: G at even cols, B at odd cols
-//! Row 2:  [ R G R G R G … ]
-//! Row 3:  [ G B G B G B … ]
+//! Column:    0      1      2      3
+//! Row 0:   [R G]  [B G]  [R G]  [B G]
+//! Row 1:   [B G]  [R G]  [B G]  [R G]
+//! Row 2:   [R G]  [B G]  [R G]  [B G]
 //! ```
 //!
 //! Consequences:
-//! - **Green**: present at every (col, row) position → full luminance resolution.
-//! - **Red**: only at (even col, even row) → ½ horizontal, ½ vertical.
-//! - **Blue**: only at (odd col, odd row) → ½ horizontal, ½ vertical.
+//! - **Green**: present in every pixel → full luminance resolution.
+//! - **Red**: only where `col + row` is even → half the pixel count.
+//! - **Blue**: only where `col + row` is odd → half the pixel count.
+//! - A pixel that lacks red always has red in both horizontal neighbours
+//!   (and likewise for blue), which is what the reconstruction below relies on.
 //!
-//! To produce a per-logical-pixel RGBA value we must:
+//! To produce a per-logical-pixel RGB value we must:
 //! 1. Assign full coverage to the green channel at every position.
-//! 2. Reconstruct red and blue from their neighbours using a 2×2 box filter.
+//! 2. Reconstruct red and blue at the pixels that lack them from the
+//!    horizontal neighbours that have them.
 //! 3. Apply a chromatic penalty that attenuates R/B at high-contrast edges to
 //!    suppress colour fringing.
+//!
+//! The physical emitter positions and apertures for this layout live in
+//! [`crate::simulate::panel`].
 
 /// Returns `[r_weight, g_weight, b_weight]` describing which physical subpixels
 /// are present at the given (`col_parity`, `row_parity`) position.
 ///
-/// A weight of `1.0` means the subpixel is physically present at this position
+/// A weight of `1.0` means the subpixel is physically present in this pixel
 /// (no reconstruction needed).  A weight of `0.0` means it is absent and must
 /// be interpolated from neighbours.
 ///
 /// | row_parity | col_parity | R   | G   | B   |
 /// |------------|-----------|-----|-----|-----|
-/// |   even     |   even    | 1.0 | 0.0 | 0.0 |
-/// |   even     |   odd     | 0.0 | 1.0 | 0.0 |
-/// |   odd      |   even    | 0.0 | 1.0 | 0.0 |
-/// |   odd      |   odd     | 0.0 | 0.0 | 1.0 |
-///
-/// Note: green is present at *all* positions (half are directly driven, the
-/// other half are reconstructed — but with trivial weight since the G subpixel
-/// at odd-col even-row and even-col odd-row positions carries the luminance).
-/// For rendering purposes, we treat green as weight 1.0 everywhere.
+/// |   even     |   even    | 1.0 | 1.0 | 0.0 |
+/// |   even     |   odd     | 0.0 | 1.0 | 1.0 |
+/// |   odd      |   even    | 0.0 | 1.0 | 1.0 |
+/// |   odd      |   odd     | 1.0 | 1.0 | 0.0 |
 #[inline]
 pub fn channel_weights(col_parity: u8, row_parity: u8) -> [f32; 3] {
-    match (col_parity & 1, row_parity & 1) {
-        (0, 0) => [1.0, 1.0, 0.0], // R present, G from neighbour
-        (1, 0) => [0.0, 1.0, 0.0], // G present only
-        (0, 1) => [0.0, 1.0, 0.0], // G present only
-        (1, 1) => [0.0, 1.0, 1.0], // B present, G from neighbour
-        _ => unreachable!(),
+    if (col_parity ^ row_parity) & 1 == 0 {
+        [1.0, 1.0, 0.0] // R + G pixel
+    } else {
+        [0.0, 1.0, 1.0] // B + G pixel
     }
 }
 
@@ -76,12 +76,13 @@ pub const BLUE_FIR: [f32; 3] = [0.25, 0.50, 0.25];
 ///
 /// # Parameters
 /// - `coverage`: linear-light coverage slice, one value per logical pixel column.
-///   Must have at least 3 elements; the first and last columns are not written
-///   (they lack a full 3-tap neighbourhood).
 /// - `row_parity`: 0 for even rows, 1 for odd rows.  Selects which subpixels
 ///   are physically present and adjusts reconstruction accordingly.
 /// - `out_r`, `out_g`, `out_b`: output slices of the same length as `coverage`.
-///   Values at index 0 and `len-1` are left unchanged.
+///
+/// Every column is written.  Taps that fall outside the row use clamp-to-edge
+/// (the border value is repeated), so glyphs of any width — including 1- and
+/// 2-pixel-wide ones — are filtered rather than left black.
 ///
 /// All values are in linear light; the caller applies EOTF encoding afterwards.
 pub fn filter_row(
@@ -96,28 +97,25 @@ pub fn filter_row(
     assert_eq!(coverage.len(), out_b.len());
 
     let n = coverage.len();
-    if n < 3 {
-        return;
-    }
 
-    for i in 1..n - 1 {
+    for i in 0..n {
         let col_parity = (i & 1) as u8;
         let [rw, _gw, bw] = channel_weights(col_parity, row_parity);
 
-        let [cl, cc, cr] = [coverage[i - 1], coverage[i], coverage[i + 1]];
+        let cl = coverage[i.saturating_sub(1)];
+        let cc = coverage[i];
+        let cr = coverage[(i + 1).min(n - 1)];
 
         // Green: full-res, gentle sharpening FIR
         out_g[i] = cl * GREEN_FIR[0] + cc * GREEN_FIR[1] + cr * GREEN_FIR[2];
 
         // Red: half-res reconstruction.
-        // When `rw == 1.0` this position has a physical R subpixel — use it
+        // When `rw == 1.0` this pixel has a physical R subpixel — filter it
         // directly.  When `rw == 0.0` the R subpixel is absent; interpolate
-        // from the nearest R positions (which are at ±1 columns).
+        // from the horizontal neighbours, which both have one.
         if rw > 0.5 {
-            // Physical R subpixel present — mild filter
             out_r[i] = cl * RED_FIR[0] + cc * RED_FIR[1] + cr * RED_FIR[2];
         } else {
-            // R absent — average neighbours (they have R subpixels)
             out_r[i] = (cl + cr) * 0.5;
         }
 
@@ -238,6 +236,50 @@ mod tests {
         assert!((r - grey).abs() < 1e-6);
         assert!((g - grey).abs() < 1e-6);
         assert!((b - grey).abs() < 1e-6);
+    }
+
+    #[test]
+    fn red_and_blue_form_a_checkerboard() {
+        // Every pixel has exactly one of R / B, and horizontal and vertical
+        // neighbours always have the other one.
+        for col in 0u8..2 {
+            for row in 0u8..2 {
+                let [r, _g, b] = channel_weights(col, row);
+                assert_eq!(r + b, 1.0, "exactly one of R/B at ({col},{row})");
+                let [r_h, _, _] = channel_weights(col ^ 1, row);
+                let [r_v, _, _] = channel_weights(col, row ^ 1);
+                assert_ne!(r, r_h, "R must alternate horizontally");
+                assert_ne!(r, r_v, "R must alternate vertically");
+            }
+        }
+    }
+
+    #[test]
+    fn border_columns_are_filtered_not_left_black() {
+        let cov = vec![0.8f32; 6];
+        for parity in 0u8..2 {
+            let (mut r, mut g, mut b) = (vec![0.0f32; 6], vec![0.0f32; 6], vec![0.0f32; 6]);
+            filter_row(&cov, parity, &mut r, &mut g, &mut b);
+            for i in [0usize, 5] {
+                assert!((r[i] - 0.8).abs() < 1e-5, "R[{i}] = {}", r[i]);
+                assert!((g[i] - 0.8).abs() < 1e-5, "G[{i}] = {}", g[i]);
+                assert!((b[i] - 0.8).abs() < 1e-5, "B[{i}] = {}", b[i]);
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_rows_are_filtered() {
+        // 1- and 2-pixel-wide glyphs (e.g. '|', '.') must not come out black.
+        for n in 1usize..=2 {
+            let cov = vec![1.0f32; n];
+            let (mut r, mut g, mut b) = (vec![0.0f32; n], vec![0.0f32; n], vec![0.0f32; n]);
+            filter_row(&cov, 0, &mut r, &mut g, &mut b);
+            for i in 0..n {
+                assert!((r[i] - 1.0).abs() < 1e-5 && (g[i] - 1.0).abs() < 1e-5 && (b[i] - 1.0).abs() < 1e-5,
+                    "width {n} col {i}: ({}, {}, {})", r[i], g[i], b[i]);
+            }
+        }
     }
 
     #[test]
