@@ -68,7 +68,11 @@ cargo build --release
 ### Run the inspector
 
 ```bash
-# Basic usage — render glyph 'A' at 64px on a pentile layout
+# Simplest: system default font, glyph 'A' at 64px, pentile layout
+cargo run --release
+
+# Pick a glyph, or a specific font
+cargo run --release -- --glyph g
 cargo run --release -- --font /path/to/font.ttf --glyph A
 
 # Full options
@@ -78,6 +82,8 @@ cargo run --release -- \
   --layout pentile \
   --size 96
 
+# --font is optional: without it KAGE uses the system's default sans-serif
+# (via fontconfig's fc-match, falling back to a list of common font paths).
 # Available layouts: rgb | bgr | pentile | delta | wrgb | grey
 # On Ubuntu, a good test font: /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
 # On macOS:                     /Library/Fonts/Arial.ttf
@@ -88,13 +94,13 @@ cargo run --release -- \
 ```bash
 # Simulate the panel: emitters at their physical positions, then optical blur.
 # Press S in the inspector to toggle raw ↔ simulated.
-cargo run --release -- --font /path/to/font.ttf --glyph g --layout pentile --simulate
+cargo run --release -- --glyph g --layout pentile --simulate
 
 # Bare emitters, no blur — see the subpixel structure itself
-cargo run --release -- --font /path/to/font.ttf --glyph g --simulate --psf-sigma 0
+cargo run --release -- --glyph g --simulate --psf-sigma 0
 
 # Blur derived from viewing distance (mm) and panel DPI
-cargo run --release -- --font /path/to/font.ttf --glyph g --simulate --viewing-dist 700 --dpi 140
+cargo run --release -- --glyph g --simulate --viewing-dist 700 --dpi 140
 ```
 
 | Flag | Default | Meaning |

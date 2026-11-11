@@ -1,9 +1,13 @@
 //! KAGE — entry point and CLI.
 //!
 //! Usage:
-//!   kage --font <path> --glyph <char> --layout <layout> [options]
+//!   kage [--font <path>] [--glyph <char>] [--layout <layout>] [options]
+//!
+//! With no --font, the system's default sans-serif font is used.
 //!
 //! Examples:
+//!   kage
+//!   kage --glyph g --layout pentile --simulate
 //!   kage --font /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf --glyph A
 //!   kage --font ./assets/fonts/test.ttf --glyph g --layout pentile --size 96
 //!   kage --font ./assets/fonts/test.ttf --glyph Q --layout rgb --simulate
@@ -34,8 +38,9 @@ use kage::{
 )]
 struct Args {
     /// Path to a TrueType or OpenType font file.
+    /// Defaults to the system's sans-serif font (see `default_font`).
     #[arg(short, long)]
-    font: String,
+    font: Option<String>,
 
     /// Unicode character to render (single character).
     #[arg(short, long, default_value = "A")]
@@ -107,6 +112,45 @@ fn parse_layout(s: &str) -> SubpixelLayout {
     }
 }
 
+// ── Default font ──────────────────────────────────────────────────────────────
+
+/// Common sans-serif fonts, tried in order when fontconfig is unavailable.
+const FALLBACK_FONTS: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/adwaita-sans-fonts/AdwaitaSans-Regular.ttf",
+    "/usr/share/fonts/liberation-sans-fonts/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/Library/Fonts/Arial.ttf",
+    "C:\\Windows\\Fonts\\arial.ttf",
+];
+
+/// Find a font to use when `--font` is not given.
+///
+/// Asks fontconfig for the system's default sans-serif (`fc-match`), then
+/// falls back to a list of well-known paths.
+fn default_font() -> Option<String> {
+    let from_fontconfig = std::process::Command::new("fc-match")
+        .args(["--format", "%{file}", "sans-serif"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .filter(|path| !path.is_empty() && std::path::Path::new(path).is_file());
+
+    from_fontconfig.or_else(|| {
+        FALLBACK_FONTS
+            .iter()
+            .find(|path| std::path::Path::new(path).is_file())
+            .map(|path| (*path).to_owned())
+    })
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -119,6 +163,14 @@ fn main() {
 
     let layout = parse_layout(&args.layout);
 
+    let font = match args.font.clone().or_else(default_font) {
+        Some(path) => path,
+        None => {
+            eprintln!("No default font found on this system. Pass one with --font <path>.");
+            std::process::exit(1);
+        }
+    };
+
     // ── Simulation params ──────────────────────────────────────────────────────
     let sim_params = if let Some(sigma) = args.psf_sigma {
         let mut p = SimulationParams::oled_default();
@@ -130,7 +182,7 @@ fn main() {
     let geometry = PanelGeometry::for_layout(layout);
 
     println!("KAGE — Kinetic Adaptive Glyph Engine");
-    println!("  Font:       {}", args.font);
+    println!("  Font:       {}{}", font, if args.font.is_none() { "  (system default)" } else { "" });
     println!("  Glyph:      '{}'  (U+{:04X})", args.glyph, args.glyph as u32);
     println!("  Size:       {}px", args.size);
     println!("  Layout:     {:?}", layout);
@@ -145,10 +197,10 @@ fn main() {
     println!();
 
     // ── Font loading ───────────────────────────────────────────────────────────
-    let face = match FontFace::load(&args.font, args.size) {
+    let face = match FontFace::load(&font, args.size) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("Error loading font '{}': {e}", args.font);
+            eprintln!("Error loading font '{font}': {e}");
             std::process::exit(1);
         }
     };
