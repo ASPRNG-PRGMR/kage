@@ -122,6 +122,52 @@ impl FontFace {
         })
     }
 
+    /// Rasterize `ch` at `scale` times the face's resolution in both axes.
+    ///
+    /// The outline is hinted at the face's own pixel size and then scaled,
+    /// so the result is the same shape as [`rasterize_grey`](Self::rasterize_grey)
+    /// produces, drawn on a grid `scale` times finer. Width, height and
+    /// bearings are in those finer pixels.
+    pub fn rasterize_grey_scaled(&self, ch: char, scale: u32) -> Option<GlyphBitmap> {
+        let scale = scale.max(1);
+        let idx = self.face.get_char_index(ch as usize)?;
+        // 16.16 fixed-point scale; FreeType applies it after hinting.
+        let fixed = (scale as i64) << 16;
+        let mut matrix = freetype::Matrix { xx: fixed as _, xy: 0, yx: 0, yy: fixed as _ };
+        let mut zero = freetype::Vector { x: 0, y: 0 };
+        self.face.set_transform(&mut matrix, &mut zero);
+        let rendered = self
+            .face
+            .load_glyph(idx, LoadFlag::DEFAULT)
+            .and_then(|()| self.face.glyph().render_glyph(RenderMode::Normal));
+        let result = rendered.ok().map(|()| {
+            let g = self.face.glyph();
+            let bm = g.bitmap();
+            let (width, height) = (bm.width().max(0) as u32, bm.rows().max(0) as u32);
+            // Rows may be padded: copy `width` bytes from each `pitch`.
+            let pitch = bm.pitch().unsigned_abs() as usize;
+            let src = bm.buffer();
+            let mut buffer = Vec::with_capacity((width * height) as usize);
+            for row in 0..height as usize {
+                buffer.extend_from_slice(&src[row * pitch..row * pitch + width as usize]);
+            }
+            GlyphBitmap {
+                width,
+                height,
+                bearing_x: g.bitmap_left(),
+                bearing_y: g.bitmap_top(),
+                advance: (g.advance().x >> 6) as i32,
+                buffer,
+                mode: RasterMode::Grey,
+            }
+        });
+        // Leave the face as we found it.
+        let one = 1i64 << 16;
+        let mut identity = freetype::Matrix { xx: one as _, xy: 0, yx: 0, yy: one as _ };
+        self.face.set_transform(&mut identity, &mut zero);
+        result
+    }
+
     /// Distance from the baseline up to the top of the line, in pixels.
     pub fn ascent(&self) -> i32 {
         self.face

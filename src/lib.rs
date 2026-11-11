@@ -47,9 +47,11 @@
 //!   bleed, gamma-aware luminance reconstruction and metrics
 //! - `viz`       — zoomable subpixel inspector (minifb) with raw / simulated views
 
+pub mod coverage;
 pub mod font;
 pub mod glyph;
 pub mod layout;
+pub mod plane;
 pub mod profile;
 pub mod render;
 pub mod simulate;
