@@ -1,0 +1,34 @@
+#version 450
+// Vulkan backend: a compute shader over storage buffers. One invocation per
+// logical pixel; buffers are row-major with row 0 at the top of the glyph.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Lo { float data[]; } lo;
+layout(std430, set = 0, binding = 1) readonly buffer Hi { float data[]; } hi;
+layout(std430, set = 0, binding = 2) buffer Out { vec4 data[]; } result;
+
+layout(std140, set = 0, binding = 3) uniform Params {
+//#include params.glsl
+} P;
+
+float kage_lo(ivec2 p) {
+    ivec2 q = clamp(p, ivec2(0), P.dims.xy - 1);
+    return lo.data[q.y * P.dims.x + q.x];
+}
+
+float kage_hi(ivec2 p) {
+    ivec2 size = P.dims.xy * P.dims.z;
+    ivec2 q = clamp(p, ivec2(0), size - 1);
+    return hi.data[q.y * size.x + q.x];
+}
+
+//#include common.glsl
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= P.dims.x || p.y >= P.dims.y) {
+        return;
+    }
+    result.data[p.y * P.dims.x + p.x] = kage_render(p);
+}

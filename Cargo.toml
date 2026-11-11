@@ -29,6 +29,21 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
+# OpenGL backend: GL bindings and an off-screen EGL context. libEGL is loaded
+# at run time, so there is no link-time dependency on it.
+glow = { version = "0.14", optional = true }
+khronos-egl = { version = "6", features = ["dynamic"], optional = true }
+
+# Vulkan backend: Vulkan bindings (libvulkan is loaded at run time) and a
+# GLSL → SPIR-V compiler for the compute shader.
+ash = { version = "0.38", optional = true }
+naga = { version = "22", features = ["glsl-in", "spv-out"], optional = true }
+
+[features]
+default = ["opengl", "vulkan"]
+opengl = ["dep:glow", "dep:khronos-egl"]
+vulkan = ["dep:ash", "dep:naga"]
+
 [profile.release]
 opt-level = 3
 lto = true

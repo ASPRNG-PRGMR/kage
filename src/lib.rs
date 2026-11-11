@@ -60,6 +60,7 @@
 pub mod coverage;
 pub mod font;
 pub mod glyph;
+pub mod gpu;
 pub mod layout;
 pub mod pipeline;
 pub mod plane;
