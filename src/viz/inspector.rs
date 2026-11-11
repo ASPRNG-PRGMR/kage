@@ -4,6 +4,11 @@
 //! [`minifb`] window — one per rendering mode (Greyscale, Subpixel AA,
 //! OLED-Aware) — and provides interactive zoom and pan.
 //!
+//! It holds two [`ViewSet`]s: the raw renderer output (one sample per logical
+//! pixel) and, optionally, the simulated panel image (oversampled, with each
+//! emitter at its physical position). Zoom and pan are always expressed in
+//! logical pixels, so toggling between the two keeps the glyph in place.
+//!
 //! ## Controls
 //!
 //! | Input | Action |
@@ -11,13 +16,19 @@
 //! | Scroll wheel | Zoom in / out, anchored to cursor position |
 //! | `+` / `=` | Zoom in (keyboard) |
 //! | `-` | Zoom out (keyboard) |
-//! | Arrow keys | Pan |
+//! | Click + drag | Pan |
+//! | Arrow keys | Pan by one pixel |
 //! | `1` | Switch to Greyscale view |
 //! | `2` | Switch to Subpixel AA view |
 //! | `3` | Switch to OLED-Aware view |
 //! | `A` | Side-by-side comparison (default) |
+//! | `S` | Toggle raw ↔ simulated panel view |
+//! | `L` | Toggle luminance-only view |
+//! | `E` | Toggle auto-exposure ↔ clipping (simulated view) |
 //! | `H` | Toggle per-channel heatmap overlay |
 //! | `Esc` | Quit |
+//!
+//! The window title shows which of these are active.
 //!
 //! ## Layout
 //!
@@ -29,6 +40,7 @@ use minifb::{Key, MouseMode, Window, WindowOptions};
 
 use crate::profile::DisplayProfile;
 use crate::render::encode_grid;
+use crate::simulate::reconstruct_luminance;
 use crate::subpixel::SubpixelGrid;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -139,6 +151,50 @@ fn parse_wxh(s: &str) -> Option<(usize, usize)> {
     Some((w, h))
 }
 
+// ── ViewSet ───────────────────────────────────────────────────────────────────
+
+/// The three rendering modes' output at one stage of the pipeline.
+///
+/// All grids are in **linear light** and share the same dimensions.
+#[derive(Debug, Clone)]
+pub struct ViewSet {
+    pub grey: SubpixelGrid,
+    pub subpixel: SubpixelGrid,
+    pub oled: SubpixelGrid,
+    /// Samples per logical pixel along each axis: 1 for renderer output,
+    /// the oversampling factor for a simulated panel image.
+    pub scale: u32,
+}
+
+impl ViewSet {
+    /// Largest channel value across all three grids.
+    fn peak(&self) -> f32 {
+        let mut peak = 0.0f32;
+        for grid in [&self.grey, &self.subpixel, &self.oled] {
+            for row in 0..grid.height {
+                for col in 0..grid.width {
+                    let px = grid.pixel(col, row);
+                    peak = peak.max(px.r).max(px.g).max(px.b);
+                }
+            }
+        }
+        peak
+    }
+}
+
+/// Scale every channel of `grid` by `factor`.
+fn scale_grid(mut grid: SubpixelGrid, factor: f32) -> SubpixelGrid {
+    for row in 0..grid.height {
+        for col in 0..grid.width {
+            let px = grid.pixel_mut(col, row);
+            px.r *= factor;
+            px.g *= factor;
+            px.b *= factor;
+        }
+    }
+    grid
+}
+
 // ── Inspector ─────────────────────────────────────────────────────────────────
 
 /// Display mode for the inspector window.
@@ -157,6 +213,7 @@ pub enum DisplayMode {
 /// Interactive zoomable subpixel inspector.
 pub struct Inspector {
     window: Window,
+    title: String,
     fb: Vec<u32>,
     win_w: usize,
     win_h: usize,
@@ -164,9 +221,20 @@ pub struct Inspector {
     min_win_w: usize,
     min_win_h: usize,
 
-    /// Zoom level: each source pixel is rendered as `zoom × zoom` host pixels.
+    /// Renderer output, linear light.
+    raw: ViewSet,
+    /// Simulated panel image, linear light (`None` without `--simulate`).
+    simulated: Option<ViewSet>,
+    profile: DisplayProfile,
+    /// Display-ready (EOTF-encoded) grids for the current view settings,
+    /// in panel order: greyscale, subpixel AA, OLED-aware.
+    shown: [SubpixelGrid; 3],
+    /// Samples per logical pixel of `shown`.
+    shown_scale: u32,
+
+    /// Zoom level: each logical pixel is rendered as `zoom × zoom` host pixels.
     zoom: f32,
-    /// Pan offset in source-pixel coordinates.
+    /// Pan offset in logical-pixel coordinates.
     pan_x: i32,
     pan_y: i32,
 
@@ -174,10 +242,13 @@ pub struct Inspector {
     drag_last: Option<(f32, f32)>,
 
     display_mode: DisplayMode,
-    /// When true, show simulated grids instead of raw render grids.
+    /// When true, show the simulated panel image instead of renderer output.
     simulate_mode: bool,
-    /// Whether simulation data is available (--simulate was passed).
-    simulate_available: bool,
+    /// When true, show reconstructed luminance instead of colour.
+    luminance: bool,
+    /// When true, the simulated view is scaled so its brightest emitter fits
+    /// in range; when false, values above 1.0 clip.
+    auto_exposure: bool,
     /// When true, R/G/B channels are shown as false-colour heatmaps.
     heatmap: bool,
 }
@@ -185,9 +256,15 @@ pub struct Inspector {
 impl Inspector {
     /// Create a new inspector window sized to 80% of the primary display.
     ///
-    /// `simulate_available` — whether simulated grids will be passed to `update()`.
-    /// If false, pressing S shows a "simulation not enabled" notice.
-    pub fn new(title: &str, simulate_available: bool) -> Result<Self, minifb::Error> {
+    /// `raw` is the renderer output and `simulated` the optional panel
+    /// simulation; both must be in **linear light**. EOTF encoding with
+    /// `profile` happens inside the inspector, once per view change.
+    pub fn new(
+        title: &str,
+        raw: ViewSet,
+        simulated: Option<ViewSet>,
+        profile: DisplayProfile,
+    ) -> Result<Self, minifb::Error> {
         let (screen_w, screen_h) = detect_screen_size();
         let win_w = ((screen_w as f64 * SCREEN_FRACTION) as usize).max(640);
         let win_h = ((screen_h as f64 * SCREEN_FRACTION) as usize).max(400);
@@ -205,22 +282,35 @@ impl Inspector {
 
         let fb = vec![BG_COLOR; win_w * win_h];
 
-        Ok(Self {
+        let mut inspector = Self {
             window: win,
+            title: title.to_owned(),
             fb,
             win_w,
             win_h,
             min_win_w: win_w,
             min_win_h: win_h,
+            raw,
+            simulated,
+            profile,
+            shown: [
+                SubpixelGrid::new(0, 0),
+                SubpixelGrid::new(0, 0),
+                SubpixelGrid::new(0, 0),
+            ],
+            shown_scale: 1,
             zoom: 8.0,
             pan_x: 0,
             pan_y: 0,
             drag_last: None,
             display_mode: DisplayMode::SideBySide,
             simulate_mode: false,
-            simulate_available,
+            luminance: false,
+            auto_exposure: true,
             heatmap: false,
-        })
+        };
+        inspector.rebuild_view();
+        Ok(inspector)
     }
 
     /// Returns `true` as long as the window is open and Esc has not been pressed.
@@ -229,44 +319,79 @@ impl Inspector {
     }
 
     /// Process input events and redraw.
-    ///
-    /// All grids must be in **linear light** — `encode_grid()` is called
-    /// internally. Press `S` to toggle between raw and simulated views.
-    #[allow(clippy::too_many_arguments)]
-    pub fn update(
-        &mut self,
-        grey_raw:  &SubpixelGrid,
-        sp_raw:    &SubpixelGrid,
-        oled_raw:  &SubpixelGrid,
-        grey_sim:  &SubpixelGrid,
-        sp_sim:    &SubpixelGrid,
-        oled_sim:  &SubpixelGrid,
-        profile:   &DisplayProfile,
-    ) -> Result<(), minifb::Error> {
+    pub fn update(&mut self) -> Result<(), minifb::Error> {
         // Clamp to minimum size — prevents Wayland Configure shrinking.
         let (new_w, new_h) = self.window.get_size();
         self.win_w = new_w.max(self.min_win_w);
         self.win_h = new_h.max(self.min_win_h);
         self.fb.resize(self.win_w * self.win_h, BG_COLOR);
 
-        // Select raw or simulated grids based on S toggle.
-        let (grey, sp, oled) = if self.simulate_mode {
-            (grey_sim, sp_sim, oled_sim)
-        } else {
-            (grey_raw, sp_raw, oled_raw)
-        };
-
-        // EOTF-encode the selected linear-light grids.
-        let grey_enc = encode_grid(grey.clone(), profile);
-        let sp_enc   = encode_grid(sp.clone(),   profile);
-        let oled_enc = encode_grid(oled.clone(), profile);
-
         self.handle_input();
-        self.draw(&grey_enc, &sp_enc, &oled_enc);
+        self.draw();
 
         self.window
             .update_with_buffer(&self.fb, self.win_w, self.win_h)?;
         Ok(())
+    }
+
+    // ── View pipeline ─────────────────────────────────────────────────────────
+
+    /// Recompute the display-ready grids for the current view settings.
+    ///
+    /// Everything up to the final step stays in linear light:
+    /// select raw / simulated → (luminance) → (exposure) → EOTF encode.
+    fn rebuild_view(&mut self) {
+        let simulated = self.simulate_mode && self.simulated.is_some();
+        let set = match (&self.simulated, simulated) {
+            (Some(sim), true) => sim,
+            _ => &self.raw,
+        };
+
+        // One exposure factor for all three panels keeps them comparable.
+        // The simulated image is luminance-preserving, so bare emitters
+        // exceed 1.0; renderer output never does.
+        let exposure = if simulated && self.auto_exposure {
+            1.0 / set.peak().max(1.0)
+        } else {
+            1.0
+        };
+
+        let prepare = |grid: &SubpixelGrid| {
+            let grid = if self.luminance {
+                reconstruct_luminance(grid)
+            } else {
+                grid.clone()
+            };
+            let grid = if exposure != 1.0 { scale_grid(grid, exposure) } else { grid };
+            encode_grid(grid, &self.profile)
+        };
+
+        self.shown = [prepare(&set.grey), prepare(&set.subpixel), prepare(&set.oled)];
+        self.shown_scale = set.scale.max(1);
+
+        let mut title = self.title.clone();
+        title.push_str(if simulated { " — simulated panel" } else { " — raw render" });
+        if simulated {
+            title.push_str(if self.auto_exposure { " (auto-exposed)" } else { " (clipped)" });
+        }
+        if self.luminance {
+            title.push_str(" — luminance");
+        }
+        if self.heatmap {
+            title.push_str(" — heatmap");
+        }
+        self.window.set_title(&title);
+    }
+
+    /// Left edge (host x) of the panel under host x-coordinate `mx`.
+    fn panel_origin_x(&self, mx: f32) -> f32 {
+        if self.display_mode != DisplayMode::SideBySide {
+            return 0.0;
+        }
+        let col_w = (self.win_w / 3).max(1);
+        let idx = ((mx.max(0.0) as usize) / col_w).min(2);
+        // Panels after the first start one pixel in, past the separator.
+        (idx * col_w + usize::from(idx > 0)) as f32
     }
 
     // ── Input ─────────────────────────────────────────────────────────────────
@@ -281,18 +406,19 @@ impl Inspector {
         // On X11:    Button4 (up) → scroll_y = +1.0, Button5 (down) → -1.0
         // On Wayland: VerticalScroll positive = scroll DOWN (inverted vs X11)
         //             Additionally, natural scrolling (common on GNOME/Fedora)
-        //             inverts again.  We invert the Wayland sign explicitly.
+        //             inverts again.
         //
-        // Anchor math — keeps the source pixel under the cursor fixed:
-        //   src = pan + mouse / old_zoom
-        //   pan = src - mouse / new_zoom
+        // Anchor math — keeps the logical pixel under the cursor fixed, with
+        // the cursor position measured from the origin of the panel it is in:
+        //   src = pan + rel / old_zoom
+        //   pan = src - rel / new_zoom
         //
         if let Some((scroll_x, scroll_y)) = self.window.get_scroll_wheel() {
             // Pick the axis with larger magnitude.
             let raw = if scroll_x.abs() >= scroll_y.abs() { scroll_x } else { scroll_y };
 
-            // Diagnostic: print scroll values on first event to help debug
-            // platform differences. Remove once confirmed working.
+            // Diagnostic: print scroll values to help debug platform
+            // differences. Remove once confirmed working.
             #[cfg(debug_assertions)]
             if raw.abs() > 0.001 {
                 eprintln!("[kage] scroll raw=({scroll_x:.3}, {scroll_y:.3})  using={raw:.3}");
@@ -305,9 +431,12 @@ impl Inspector {
                     .get_mouse_pos(MouseMode::Clamp)
                     .unwrap_or((self.win_w as f32 / 2.0, self.win_h as f32 / 2.0));
 
-                // Source pixel under cursor before zoom change.
-                let src_col = self.pan_x as f32 + mx / old_zoom;
-                let src_row = self.pan_y as f32 + (my - LABEL_H as f32).max(0.0) / old_zoom;
+                let rel_x = mx - self.panel_origin_x(mx);
+                let rel_y = (my - LABEL_H as f32).max(0.0);
+
+                // Logical pixel under cursor before zoom change.
+                let src_col = self.pan_x as f32 + rel_x / old_zoom;
+                let src_row = self.pan_y as f32 + rel_y / old_zoom;
 
                 // Multiplicative zoom: 1.2× per tick.
                 // Positive raw = scroll up on X11 → zoom in.
@@ -320,9 +449,9 @@ impl Inspector {
                     self.zoom = (self.zoom / ZOOM_FACTOR).max(1.0);
                 }
 
-                // Adjust pan so the same source pixel stays under the cursor.
-                self.pan_x = (src_col - mx / self.zoom).round() as i32;
-                self.pan_y = (src_row - (my - LABEL_H as f32).max(0.0) / self.zoom).round() as i32;
+                // Adjust pan so the same logical pixel stays under the cursor.
+                self.pan_x = (src_col - rel_x / self.zoom).round() as i32;
+                self.pan_y = (src_row - rel_y / self.zoom).round() as i32;
             }
         }
 
@@ -349,13 +478,32 @@ impl Inspector {
             self.pan_y += pan_step;
         }
 
-        // ── Simulate toggle ────────────────────────────────────────────────
+        // ── View toggles (each changes what is encoded for display) ────────
+        let mut view_changed = false;
+
         if self.window.is_key_pressed(Key::S, minifb::KeyRepeat::No) {
-            if self.simulate_available {
+            if self.simulated.is_some() {
                 self.simulate_mode = !self.simulate_mode;
+                view_changed = true;
             } else {
                 eprintln!("[kage] Simulation not enabled — re-run with --simulate");
             }
+        }
+        if self.window.is_key_pressed(Key::L, minifb::KeyRepeat::No) {
+            self.luminance = !self.luminance;
+            view_changed = true;
+        }
+        if self.window.is_key_pressed(Key::E, minifb::KeyRepeat::No) {
+            self.auto_exposure = !self.auto_exposure;
+            view_changed = true;
+        }
+        if self.window.is_key_pressed(Key::H, minifb::KeyRepeat::No) {
+            self.heatmap = !self.heatmap;
+            view_changed = true;
+        }
+
+        if view_changed {
+            self.rebuild_view();
         }
 
         // Display mode
@@ -372,28 +520,27 @@ impl Inspector {
             self.display_mode = DisplayMode::SideBySide;
         }
 
-        // Heatmap toggle
-        if self.window.is_key_pressed(Key::H, minifb::KeyRepeat::No) {
-            self.heatmap = !self.heatmap;
-        }
-
         // ── Mouse drag pan ─────────────────────────────────────────────────
         //
-        // Left-click and drag pans all panels together.
-        // We track the mouse position from the previous frame and compute the
-        // delta in host pixels, then convert to source pixels via zoom.
+        // Left-click and drag pans all panels together. Pan is in whole
+        // logical pixels, so only the whole-pixel part of the drag is
+        // consumed each frame; the remainder stays in `drag_last` and
+        // accumulates, which keeps slow drags from being rounded away.
         let mouse_down = self.window.get_mouse_down(minifb::MouseButton::Left);
         let mouse_pos  = self.window.get_mouse_pos(MouseMode::Clamp)
             .unwrap_or((0.0, 0.0));
 
         if mouse_down {
-            if let Some((last_x, last_y)) = self.drag_last {
-                let dx = (mouse_pos.0 - last_x) / self.zoom;
-                let dy = (mouse_pos.1 - last_y) / self.zoom;
-                self.pan_x -= dx.round() as i32;
-                self.pan_y -= dy.round() as i32;
+            match self.drag_last {
+                Some((last_x, last_y)) => {
+                    let dx = ((mouse_pos.0 - last_x) / self.zoom).trunc();
+                    let dy = ((mouse_pos.1 - last_y) / self.zoom).trunc();
+                    self.pan_x -= dx as i32;
+                    self.pan_y -= dy as i32;
+                    self.drag_last = Some((last_x + dx * self.zoom, last_y + dy * self.zoom));
+                }
+                None => self.drag_last = Some(mouse_pos),
             }
-            self.drag_last = Some(mouse_pos);
         } else {
             self.drag_last = None;
         }
@@ -401,7 +548,7 @@ impl Inspector {
 
     // ── Drawing ───────────────────────────────────────────────────────────────
 
-    fn draw(&mut self, grey: &SubpixelGrid, sp: &SubpixelGrid, oled: &SubpixelGrid) {
+    fn draw(&mut self) {
         // Clear
         for px in self.fb.iter_mut() {
             *px = BG_COLOR;
@@ -418,15 +565,15 @@ impl Inspector {
 
         match self.display_mode {
             DisplayMode::Greyscale => {
-                self.draw_panel(grey, 0, LABEL_H, self.win_w, glyph_area_h);
+                self.draw_panel(0, 0, LABEL_H, self.win_w, glyph_area_h);
                 self.draw_label("Greyscale AA", 0, self.win_w);
             }
             DisplayMode::SubpixelAa => {
-                self.draw_panel(sp, 0, LABEL_H, self.win_w, glyph_area_h);
+                self.draw_panel(1, 0, LABEL_H, self.win_w, glyph_area_h);
                 self.draw_label("Subpixel AA (ClearType-style)", 0, self.win_w);
             }
             DisplayMode::OledAware => {
-                self.draw_panel(oled, 0, LABEL_H, self.win_w, glyph_area_h);
+                self.draw_panel(2, 0, LABEL_H, self.win_w, glyph_area_h);
                 self.draw_label("OLED-Aware", 0, self.win_w);
             }
             DisplayMode::SideBySide => {
@@ -434,21 +581,21 @@ impl Inspector {
                 let sep = 1;
 
                 // Panel 1: Greyscale
-                self.draw_panel(grey, 0, LABEL_H, col_w.saturating_sub(sep), glyph_area_h);
+                self.draw_panel(0, 0, LABEL_H, col_w.saturating_sub(sep), glyph_area_h);
                 self.draw_label("Greyscale AA", 0, col_w);
 
                 // Separator
                 self.draw_separator(col_w);
 
                 // Panel 2: Subpixel AA
-                self.draw_panel(sp, col_w + sep, LABEL_H, col_w.saturating_sub(sep), glyph_area_h);
+                self.draw_panel(1, col_w + sep, LABEL_H, col_w.saturating_sub(sep), glyph_area_h);
                 self.draw_label("Subpixel AA", col_w, col_w);
 
                 // Separator
                 self.draw_separator(col_w * 2);
 
                 // Panel 3: OLED-Aware
-                self.draw_panel(oled, col_w * 2 + sep, LABEL_H, self.win_w - col_w * 2 - sep, glyph_area_h);
+                self.draw_panel(2, col_w * 2 + sep, LABEL_H, self.win_w - col_w * 2 - sep, glyph_area_h);
                 self.draw_label("OLED-Aware", col_w * 2, self.win_w - col_w * 2);
             }
         }
@@ -457,33 +604,46 @@ impl Inspector {
         self.draw_status_bar();
     }
 
-    /// Blit one [`SubpixelGrid`] into a rectangular region of the framebuffer.
+    /// Blit `self.shown[index]` into a rectangular region of the framebuffer.
     ///
-    /// Each source pixel is scaled to `zoom × zoom` host pixels.
-    /// Pan offsets are applied in source-pixel coordinates.
+    /// Each logical pixel is scaled to `zoom × zoom` host pixels, and is made
+    /// of `shown_scale × shown_scale` grid samples. Pan offsets are applied in
+    /// logical-pixel coordinates.
     fn draw_panel(
         &mut self,
-        grid: &SubpixelGrid,
+        index: usize,
         panel_x: usize,
         panel_y: usize,
         panel_w: usize,
         panel_h: usize,
     ) {
         let zoom = self.zoom;
+        let scale = self.shown_scale as f32;
+        let grid = &self.shown[index];
         let src_w = grid.width as i32;
         let src_h = grid.height as i32;
 
         for wy in 0..panel_h as i32 {
+            let fb_y = panel_y + wy as usize;
+            if fb_y >= self.win_h {
+                break;
+            }
+            // Host pixel → logical pixel (pan + zoom) → grid sample (scale).
+            let ly = self.pan_y as f32 + wy as f32 / zoom;
+            let src_row = (ly * scale).floor() as i32;
+
             for wx in 0..panel_w as i32 {
-                // Map host pixel → source pixel (accounting for pan and zoom).
-                // Using f32 division then floor gives correct sub-pixel mapping.
-                let src_col = self.pan_x + (wx as f32 / zoom) as i32;
-                let src_row = self.pan_y + (wy as f32 / zoom) as i32;
+                let fb_x = panel_x + wx as usize;
+                if fb_x >= self.win_w {
+                    break;
+                }
+                let lx = self.pan_x as f32 + wx as f32 / zoom;
+                let src_col = (lx * scale).floor() as i32;
 
                 let color = if src_col >= 0 && src_col < src_w && src_row >= 0 && src_row < src_h {
                     let px = grid.pixel(src_col as u32, src_row as u32);
                     if self.heatmap {
-                        self.heatmap_color(px.r, px.g, px.b)
+                        heatmap_color(px.r, px.g, px.b)
                     } else {
                         let r = (px.r.clamp(0.0, 1.0) * 255.0).round() as u32;
                         let g = (px.g.clamp(0.0, 1.0) * 255.0).round() as u32;
@@ -491,16 +651,12 @@ impl Inspector {
                         (0xFF << 24) | (r << 16) | (g << 8) | b
                     }
                 } else {
-                    // Out-of-bounds: checkerboard to show glyph extent
-                    let checker = ((src_col ^ src_row) & 1) == 0;
+                    // Out-of-bounds: per-logical-pixel checkerboard to show glyph extent
+                    let checker = ((lx.floor() as i32 ^ ly.floor() as i32) & 1) == 0;
                     if checker { 0xFF_18_18_18 } else { 0xFF_22_22_22 }
                 };
 
-                let fb_x = panel_x + wx as usize;
-                let fb_y = panel_y + wy as usize;
-                if fb_x < self.win_w && fb_y < self.win_h {
-                    self.fb[fb_y * self.win_w + fb_x] = color;
-                }
+                self.fb[fb_y * self.win_w + fb_x] = color;
             }
         }
 
@@ -510,7 +666,11 @@ impl Inspector {
         }
     }
 
-    /// Draw thin grid lines between zoomed pixels for easy inspection.
+    /// Draw thin grid lines on logical-pixel boundaries for easy inspection.
+    ///
+    /// A line is drawn on the first host pixel of each logical pixel, using
+    /// the same host → logical mapping as [`Self::draw_panel`], so the lines
+    /// stay on the boundaries at fractional zoom levels too.
     fn draw_pixel_grid(
         &mut self,
         panel_x: usize,
@@ -520,32 +680,27 @@ impl Inspector {
         zoom: f32,
     ) {
         let grid_color = 0xFF_28_28_28;
-        let zoom_i = zoom.round() as usize;
-        if zoom_i == 0 { return; }
+        let starts_pixel = |w: usize| {
+            w == 0 || (w as f32 / zoom).floor() != ((w - 1) as f32 / zoom).floor()
+        };
+        let x_end = (panel_x + panel_w).min(self.win_w);
+        let y_end = (panel_y + panel_h).min(self.win_h);
 
-        // Vertical lines — one per source pixel column boundary.
-        let mut x = panel_x;
-        while x < panel_x + panel_w {
-            if (x - panel_x) % zoom_i == 0 {
-                for y in panel_y..(panel_y + panel_h).min(self.win_h) {
-                    if x < self.win_w {
-                        self.fb[y * self.win_w + x] = grid_color;
-                    }
+        // Vertical lines — one per logical pixel column boundary.
+        for x in panel_x..x_end {
+            if starts_pixel(x - panel_x) {
+                for y in panel_y..y_end {
+                    self.fb[y * self.win_w + x] = grid_color;
                 }
             }
-            x += 1;
         }
-        // Horizontal lines — one per source pixel row boundary.
-        let mut y = panel_y;
-        while y < panel_y + panel_h {
-            if (y - panel_y) % zoom_i == 0 {
-                for x in panel_x..(panel_x + panel_w).min(self.win_w) {
-                    if y < self.win_h {
-                        self.fb[y * self.win_w + x] = grid_color;
-                    }
+        // Horizontal lines — one per logical pixel row boundary.
+        for y in panel_y..y_end {
+            if starts_pixel(y - panel_y) {
+                for x in panel_x..x_end {
+                    self.fb[y * self.win_w + x] = grid_color;
                 }
             }
-            y += 1;
         }
     }
 
@@ -593,29 +748,69 @@ impl Inspector {
             self.fb[y * self.win_w + x] = bar_color;
         }
     }
+}
 
-    /// Convert R/G/B values to a false-colour heatmap for per-channel analysis.
-    ///
-    /// Each channel is displayed at 1/3 of the horizontal width:
-    /// left third = R energy, centre = G energy, right = B energy.
-    ///
-    /// Since we can't know which third of the pixel we're in here (we only have
-    /// the final colour), we use a simple false-colour encoding instead:
-    /// - Pure R deviation from grey → red tint
-    /// - Pure B deviation from grey → blue tint
-    /// - Near-grey → neutral
-    fn heatmap_color(&self, r: f32, g: f32, b: f32) -> u32 {
-        // Amplify channel imbalance for visibility
-        let scale = 3.0;
-        let grey = (r + g + b) / 3.0;
-        let dr = ((r - grey) * scale).clamp(-1.0, 1.0);
-        let db = ((b - grey) * scale).clamp(-1.0, 1.0);
+/// Convert R/G/B values to a false-colour heatmap for per-channel analysis.
+///
+/// - R above the pixel's mean → red tint
+/// - B above the pixel's mean → blue tint
+/// - Near-grey → neutral
+fn heatmap_color(r: f32, g: f32, b: f32) -> u32 {
+    // Amplify channel imbalance for visibility
+    let scale = 3.0;
+    let grey = (r + g + b) / 3.0;
+    let dr = ((r - grey) * scale).clamp(-1.0, 1.0);
+    let db = ((b - grey) * scale).clamp(-1.0, 1.0);
 
-        let base = (grey.clamp(0.0, 1.0) * 180.0) as u32;
-        let r_out = (base as f32 + dr * 75.0).clamp(0.0, 255.0) as u32;
-        let g_out = base;
-        let b_out = (base as f32 + db * 75.0).clamp(0.0, 255.0) as u32;
+    let base = (grey.clamp(0.0, 1.0) * 180.0) as u32;
+    let r_out = (base as f32 + dr * 75.0).clamp(0.0, 255.0) as u32;
+    let g_out = base;
+    let b_out = (base as f32 + db * 75.0).clamp(0.0, 255.0) as u32;
 
-        (0xFF << 24) | (r_out << 16) | (g_out << 8) | b_out
+    (0xFF << 24) | (r_out << 16) | (g_out << 8) | b_out
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::subpixel::SubpixelPixel;
+
+    #[test]
+    fn parse_wxh_accepts_common_forms() {
+        assert_eq!(parse_wxh("1920x1080"), Some((1920, 1080)));
+        assert_eq!(parse_wxh("2560x1440p60"), Some((2560, 1440)));
+        assert_eq!(parse_wxh("garbage"), None);
+    }
+
+    #[test]
+    fn view_set_peak_spans_all_grids() {
+        let mut oled = SubpixelGrid::new(2, 2);
+        *oled.pixel_mut(1, 1) = SubpixelPixel { r: 0.2, g: 3.5, b: 0.1 };
+        let set = ViewSet {
+            grey: SubpixelGrid::new(2, 2),
+            subpixel: SubpixelGrid::new(2, 2),
+            oled,
+            scale: 1,
+        };
+        assert_eq!(set.peak(), 3.5);
+    }
+
+    #[test]
+    fn scale_grid_scales_every_channel() {
+        let mut g = SubpixelGrid::new(1, 1);
+        *g.pixel_mut(0, 0) = SubpixelPixel { r: 2.0, g: 4.0, b: 1.0 };
+        let p = scale_grid(g, 0.25).pixel(0, 0);
+        assert_eq!((p.r, p.g, p.b), (0.5, 1.0, 0.25));
+    }
+
+    #[test]
+    fn heatmap_is_neutral_for_grey_and_tinted_for_imbalance() {
+        let channels = |c: u32| ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+        let (r, g, b) = channels(heatmap_color(0.5, 0.5, 0.5));
+        assert!(r == g && g == b);
+        let (r, _, b) = channels(heatmap_color(0.9, 0.5, 0.1));
+        assert!(r > b, "red excess should tint red");
     }
 }

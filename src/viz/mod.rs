@@ -1,2 +1,2 @@
 pub mod inspector;
-pub use inspector::Inspector;
+pub use inspector::{Inspector, ViewSet};
