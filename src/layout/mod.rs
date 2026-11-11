@@ -51,6 +51,18 @@ pub enum SubpixelLayout {
 }
 
 impl SubpixelLayout {
+    /// Human-readable name for user interfaces.
+    pub fn label(&self) -> &'static str {
+        match self {
+            SubpixelLayout::RgbStripe => "RGB stripe",
+            SubpixelLayout::BgrStripe => "BGR stripe",
+            SubpixelLayout::PentileRgbg => "Pentile RGBG",
+            SubpixelLayout::DeltaRgb => "Delta RGB (QD-OLED)",
+            SubpixelLayout::Wrgb => "WRGB (WOLED)",
+            SubpixelLayout::Greyscale => "greyscale",
+        }
+    }
+
     /// Returns `true` if subpixel rendering is likely to be beneficial.
     ///
     /// Returns `false` for layouts where the chromatic penalty outweighs the

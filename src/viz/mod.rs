@@ -1,2 +1,3 @@
 pub mod inspector;
-pub use inspector::{Inspector, ViewSet};
+pub mod text;
+pub use inspector::{Inspector, InspectorConfig, PanelMetrics, ViewSet};

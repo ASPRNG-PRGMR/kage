@@ -1,43 +1,35 @@
 //! Zoomable subpixel inspector.
 //!
-//! [`Inspector`] renders three [`SubpixelGrid`]s side-by-side in a
-//! [`minifb`] window — one per rendering mode (Greyscale, Subpixel AA,
-//! OLED-Aware) — and provides interactive zoom and pan.
+//! [`Inspector`] shows one glyph rendered three ways — Greyscale AA,
+//! Subpixel AA and OLED-Aware — as three titled panels in a [`minifb`]
+//! window, with a header explaining what is on screen and a footer listing
+//! the controls.
 //!
 //! It holds two [`ViewSet`]s: the raw renderer output (one sample per logical
 //! pixel) and, optionally, the simulated panel image (oversampled, with each
-//! emitter at its physical position). Zoom and pan are always expressed in
-//! logical pixels, so toggling between the two keeps the glyph in place.
+//! emitter at its physical position). Zoom and the view centre are expressed
+//! in logical pixels, so toggling between the two keeps the glyph in place.
 //!
 //! ## Controls
 //!
 //! | Input | Action |
 //! |-------|--------|
 //! | Scroll wheel | Zoom in / out, anchored to cursor position |
-//! | `+` / `=` | Zoom in (keyboard) |
-//! | `-` | Zoom out (keyboard) |
+//! | `+` / `=`, `-` | Zoom in / out (keyboard) |
 //! | Click + drag | Pan |
 //! | Arrow keys | Pan by one pixel |
-//! | `1` | Switch to Greyscale view |
-//! | `2` | Switch to Subpixel AA view |
-//! | `3` | Switch to OLED-Aware view |
-//! | `A` | Side-by-side comparison (default) |
+//! | `R` | Reset: fit the glyph to the panel |
+//! | `1` `2` `3` | Show a single panel |
+//! | `A` | All three side by side (default) |
 //! | `S` | Toggle raw ↔ simulated panel view |
 //! | `L` | Toggle luminance-only view |
 //! | `E` | Toggle auto-exposure ↔ clipping (simulated view) |
 //! | `H` | Toggle per-channel heatmap overlay |
 //! | `Esc` | Quit |
-//!
-//! The window title shows which of these are active.
-//!
-//! ## Layout
-//!
-//! In side-by-side mode the window is divided into three equal columns.
-//! A 1-pixel separator line is drawn between columns.
-//! A label strip at the top identifies each column.
 
-use minifb::{Key, MouseMode, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 
+use super::text::TextRenderer;
 use crate::profile::DisplayProfile;
 use crate::render::encode_grid;
 use crate::simulate::reconstruct_luminance;
@@ -51,17 +43,50 @@ const SCREEN_FRACTION: f64 = 0.80;
 const FALLBACK_WIN_W: usize = 1280;
 /// Fallback window height.
 const FALLBACK_WIN_H: usize = 800;
-/// Height of the label strip at the top of the window, in host pixels.
-const LABEL_H: usize = 20;
-/// Colour of the separator line between panels (dark grey).
-const SEPARATOR_COLOR: u32 = 0xFF_33_33_33;
-/// Background colour (near-black).
-const BG_COLOR: u32 = 0xFF_10_10_10;
-/// Label strip background.
-const LABEL_BG: u32 = 0xFF_1A_1A_2E;
-/// Label text colour — reserved for Phase 4 when real text rendering lands in the inspector.
-#[allow(dead_code)]
-const LABEL_FG: u32 = 0xFF_E0_E0_E0;
+
+// Layout, in host pixels.
+const HEADER_H: usize = 72;
+const FOOTER_H: usize = 38;
+const MARGIN: usize = 14;
+const GAP: usize = 12;
+const CARD_HEAD_H: usize = 62;
+const PAD: i32 = 14;
+
+// Palette.
+const BG: u32 = 0xFF_0F_11_15;
+const HEADER_BG: u32 = 0xFF_15_18_21;
+const CARD_BG: u32 = 0xFF_17_1A_22;
+const VIEW_BG: u32 = 0xFF_08_09_0C;
+const BORDER: u32 = 0xFF_26_2B_36;
+const GLYPH_OUTLINE: u32 = 0xFF_2E_34_42;
+const TEXT: u32 = 0xFF_E6_E9_EF;
+const TEXT_DIM: u32 = 0xFF_8B_93_A3;
+const CHIP_BG: u32 = 0xFF_22_27_33;
+const CHIP_ON_BG: u32 = 0xFF_2A_42_6B;
+const CHIP_ON_TEXT: u32 = 0xFF_D6_E6_FF;
+
+const ZOOM_MIN: f32 = 1.0;
+const ZOOM_MAX: f32 = 64.0;
+const ZOOM_STEP: f32 = 1.2;
+
+/// Title, accent colour and one-line description of each panel.
+const PANELS: [(&str, u32, &str); 3] = [
+    (
+        "Greyscale AA",
+        0xFF_4A_90_D9,
+        "Baseline: every subpixel gets the same coverage. No colour fringes, softest edges.",
+    ),
+    (
+        "Subpixel AA",
+        0xFF_E8_7B_3A,
+        "ClearType-style: each colour channel filtered separately. Sharper, but fringes.",
+    ),
+    (
+        "OLED-Aware",
+        0xFF_5A_C9_5A,
+        "Filter matched to the panel's subpixel layout; fringes suppressed at hard edges.",
+    ),
+];
 
 // ── Screen resolution detection ───────────────────────────────────────────────
 
@@ -195,6 +220,107 @@ fn scale_grid(mut grid: SubpixelGrid, factor: f32) -> SubpixelGrid {
     grid
 }
 
+// ── Configuration ─────────────────────────────────────────────────────────────
+
+/// Simulation quality numbers for one rendering mode, shown in its panel
+/// heading while the simulated view is active.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PanelMetrics {
+    /// RMS luminance difference from the intended coverage.
+    pub luminance_error: f32,
+    /// RMS colour residue in the simulated image (fringing).
+    pub chroma: f32,
+}
+
+/// What the inspector should say about what it is showing.
+#[derive(Debug, Clone, Default)]
+pub struct InspectorConfig {
+    /// OS window title.
+    pub window_title: String,
+    /// What is being rendered, e.g. `Glyph 'g' · Noto Sans · 64 px`.
+    pub subject: String,
+    /// Display name of the target subpixel layout, e.g. `Pentile RGBG`.
+    pub layout_name: String,
+    /// Short description of the simulation settings, e.g. blur width.
+    pub simulation_note: Option<String>,
+    /// Per-panel metrics, in panel order (greyscale, subpixel AA, OLED-aware).
+    pub metrics: Option<[PanelMetrics; 3]>,
+    /// Font file used for the interface text. Without one (or if it fails to
+    /// load) the inspector still works, but shows no text.
+    pub ui_font: Option<String>,
+}
+
+// ── Layout ────────────────────────────────────────────────────────────────────
+
+/// A rectangle in host pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rect {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+impl Rect {
+    fn contains(&self, px: f32, py: f32) -> bool {
+        px >= self.x as f32
+            && px < (self.x + self.w) as f32
+            && py >= self.y as f32
+            && py < (self.y + self.h) as f32
+    }
+
+    fn right(&self) -> i32 {
+        self.x + self.w
+    }
+}
+
+/// One panel: a heading above a zoomable viewport.
+#[derive(Debug, Clone, Copy)]
+struct Card {
+    /// Which rendering mode it shows (index into [`PANELS`]).
+    index: usize,
+    /// The whole card, heading included.
+    outer: Rect,
+    /// The viewport the glyph is drawn into.
+    view: Rect,
+}
+
+/// Lay out the cards for a window of `win_w` × `win_h`.
+fn layout_cards(win_w: usize, win_h: usize, mode: DisplayMode) -> Vec<Card> {
+    let indices: &[usize] = match mode {
+        DisplayMode::Greyscale => &[0],
+        DisplayMode::SubpixelAa => &[1],
+        DisplayMode::OledAware => &[2],
+        DisplayMode::SideBySide => &[0, 1, 2],
+    };
+    let n = indices.len() as i32;
+    let top = (HEADER_H + MARGIN) as i32;
+    let bottom = win_h as i32 - (FOOTER_H + MARGIN) as i32;
+    let region_w = win_w as i32 - 2 * MARGIN as i32;
+    let card_w = ((region_w - GAP as i32 * (n - 1)) / n).max(0);
+    let card_h = (bottom - top).max(0);
+
+    indices
+        .iter()
+        .enumerate()
+        .map(|(slot, &index)| {
+            let outer = Rect {
+                x: MARGIN as i32 + slot as i32 * (card_w + GAP as i32),
+                y: top,
+                w: card_w,
+                h: card_h,
+            };
+            let view = Rect {
+                x: outer.x + 1,
+                y: outer.y + CARD_HEAD_H as i32,
+                w: (outer.w - 2).max(0),
+                h: (outer.h - CARD_HEAD_H as i32 - 1).max(0),
+            };
+            Card { index, outer, view }
+        })
+        .collect()
+}
+
 // ── Inspector ─────────────────────────────────────────────────────────────────
 
 /// Display mode for the inspector window.
@@ -210,10 +336,27 @@ pub enum DisplayMode {
     SideBySide,
 }
 
+/// Everything that determines what a frame looks like. A frame is only
+/// redrawn when this changes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FrameState {
+    win_w: usize,
+    win_h: usize,
+    zoom: f32,
+    center_x: f32,
+    center_y: f32,
+    display_mode: DisplayMode,
+    simulate_mode: bool,
+    luminance: bool,
+    auto_exposure: bool,
+    heatmap: bool,
+}
+
 /// Interactive zoomable subpixel inspector.
 pub struct Inspector {
     window: Window,
-    title: String,
+    config: InspectorConfig,
+    text: Option<TextRenderer>,
     fb: Vec<u32>,
     win_w: usize,
     win_h: usize,
@@ -223,7 +366,7 @@ pub struct Inspector {
 
     /// Renderer output, linear light.
     raw: ViewSet,
-    /// Simulated panel image, linear light (`None` without `--simulate`).
+    /// Simulated panel image, linear light (`None` if simulation is off).
     simulated: Option<ViewSet>,
     profile: DisplayProfile,
     /// Display-ready (EOTF-encoded) grids for the current view settings,
@@ -234,11 +377,14 @@ pub struct Inspector {
 
     /// Zoom level: each logical pixel is rendered as `zoom × zoom` host pixels.
     zoom: f32,
-    /// Pan offset in logical-pixel coordinates.
-    pan_x: i32,
-    pan_y: i32,
+    /// Logical-pixel coordinate shown at the centre of every viewport.
+    center_x: f32,
+    center_y: f32,
+    /// While true the glyph is kept fitted to the viewport (until the user
+    /// zooms or pans).
+    auto_fit: bool,
 
-    /// Mouse drag state for panning.
+    /// Mouse position on the previous frame of a drag.
     drag_last: Option<(f32, f32)>,
 
     display_mode: DisplayMode,
@@ -251,6 +397,9 @@ pub struct Inspector {
     auto_exposure: bool,
     /// When true, R/G/B channels are shown as false-colour heatmaps.
     heatmap: bool,
+
+    /// State of the frame currently in `fb`.
+    drawn: Option<FrameState>,
 }
 
 impl Inspector {
@@ -260,7 +409,7 @@ impl Inspector {
     /// simulation; both must be in **linear light**. EOTF encoding with
     /// `profile` happens inside the inspector, once per view change.
     pub fn new(
-        title: &str,
+        config: InspectorConfig,
         raw: ViewSet,
         simulated: Option<ViewSet>,
         profile: DisplayProfile,
@@ -270,7 +419,7 @@ impl Inspector {
         let win_h = ((screen_h as f64 * SCREEN_FRACTION) as usize).max(400);
 
         let mut win = Window::new(
-            title,
+            &config.window_title,
             win_w,
             win_h,
             WindowOptions {
@@ -280,12 +429,13 @@ impl Inspector {
         )?;
         win.set_target_fps(60);
 
-        let fb = vec![BG_COLOR; win_w * win_h];
+        let text = config.ui_font.as_deref().and_then(TextRenderer::new);
 
         let mut inspector = Self {
             window: win,
-            title: title.to_owned(),
-            fb,
+            config,
+            text,
+            fb: vec![BG; win_w * win_h],
             win_w,
             win_h,
             min_win_w: win_w,
@@ -300,16 +450,19 @@ impl Inspector {
             ],
             shown_scale: 1,
             zoom: 8.0,
-            pan_x: 0,
-            pan_y: 0,
+            center_x: 0.0,
+            center_y: 0.0,
+            auto_fit: true,
             drag_last: None,
             display_mode: DisplayMode::SideBySide,
             simulate_mode: false,
             luminance: false,
             auto_exposure: true,
             heatmap: false,
+            drawn: None,
         };
         inspector.rebuild_view();
+        inspector.fit();
         Ok(inspector)
     }
 
@@ -318,20 +471,85 @@ impl Inspector {
         self.window.is_open() && !self.window.is_key_down(Key::Escape)
     }
 
-    /// Process input events and redraw.
+    /// Process input events and redraw if anything changed.
     pub fn update(&mut self) -> Result<(), minifb::Error> {
         // Clamp to minimum size — prevents Wayland Configure shrinking.
         let (new_w, new_h) = self.window.get_size();
         self.win_w = new_w.max(self.min_win_w);
         self.win_h = new_h.max(self.min_win_h);
-        self.fb.resize(self.win_w * self.win_h, BG_COLOR);
+        self.fb.resize(self.win_w * self.win_h, BG);
 
         self.handle_input();
-        self.draw();
+        if self.auto_fit {
+            self.fit();
+        }
+
+        let state = self.frame_state();
+        if self.drawn != Some(state) {
+            self.draw();
+            self.drawn = Some(state);
+        }
 
         self.window
             .update_with_buffer(&self.fb, self.win_w, self.win_h)?;
         Ok(())
+    }
+
+    /// Switch between the raw render and the simulated panel image.
+    /// Has no effect if no simulation was supplied.
+    pub fn set_simulated(&mut self, simulated: bool) {
+        if self.simulated.is_some() && self.simulate_mode != simulated {
+            self.simulate_mode = simulated;
+            self.rebuild_view();
+        }
+    }
+
+    /// Write the frame currently on screen to a binary PPM image.
+    pub fn save_ppm(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+        write!(out, "P6\n{} {}\n255\n", self.win_w, self.win_h)?;
+        for px in &self.fb {
+            out.write_all(&[(px >> 16) as u8, (px >> 8) as u8, *px as u8])?;
+        }
+        out.flush()
+    }
+
+    fn frame_state(&self) -> FrameState {
+        FrameState {
+            win_w: self.win_w,
+            win_h: self.win_h,
+            zoom: self.zoom,
+            center_x: self.center_x,
+            center_y: self.center_y,
+            display_mode: self.display_mode,
+            simulate_mode: self.simulate_mode,
+            luminance: self.luminance,
+            auto_exposure: self.auto_exposure,
+            heatmap: self.heatmap,
+        }
+    }
+
+    fn cards(&self) -> Vec<Card> {
+        layout_cards(self.win_w, self.win_h, self.display_mode)
+    }
+
+    /// Whether the simulated image is what is currently on screen.
+    fn showing_simulation(&self) -> bool {
+        self.simulate_mode && self.simulated.is_some()
+    }
+
+    /// Centre the glyph and zoom so it fills most of a viewport.
+    fn fit(&mut self) {
+        let (gw, gh) = (self.raw.grey.width as f32, self.raw.grey.height as f32);
+        self.center_x = gw / 2.0;
+        self.center_y = gh / 2.0;
+        if let Some(card) = self.cards().first() {
+            if gw > 0.0 && gh > 0.0 && card.view.w > 0 && card.view.h > 0 {
+                let fit = (card.view.w as f32 / gw).min(card.view.h as f32 / gh) * 0.82;
+                self.zoom = fit.clamp(ZOOM_MIN, ZOOM_MAX);
+            }
+        }
     }
 
     // ── View pipeline ─────────────────────────────────────────────────────────
@@ -341,7 +559,7 @@ impl Inspector {
     /// Everything up to the final step stays in linear light:
     /// select raw / simulated → (luminance) → (exposure) → EOTF encode.
     fn rebuild_view(&mut self) {
-        let simulated = self.simulate_mode && self.simulated.is_some();
+        let simulated = self.showing_simulation();
         let set = match (&self.simulated, simulated) {
             (Some(sim), true) => sim,
             _ => &self.raw,
@@ -368,386 +586,420 @@ impl Inspector {
 
         self.shown = [prepare(&set.grey), prepare(&set.subpixel), prepare(&set.oled)];
         self.shown_scale = set.scale.max(1);
-
-        let mut title = self.title.clone();
-        title.push_str(if simulated { " — simulated panel" } else { " — raw render" });
-        if simulated {
-            title.push_str(if self.auto_exposure { " (auto-exposed)" } else { " (clipped)" });
-        }
-        if self.luminance {
-            title.push_str(" — luminance");
-        }
-        if self.heatmap {
-            title.push_str(" — heatmap");
-        }
-        self.window.set_title(&title);
-    }
-
-    /// Left edge (host x) of the panel under host x-coordinate `mx`.
-    fn panel_origin_x(&self, mx: f32) -> f32 {
-        if self.display_mode != DisplayMode::SideBySide {
-            return 0.0;
-        }
-        let col_w = (self.win_w / 3).max(1);
-        let idx = ((mx.max(0.0) as usize) / col_w).min(2);
-        // Panels after the first start one pixel in, past the separator.
-        (idx * col_w + usize::from(idx > 0)) as f32
+        // The grids changed even if no view flag did (first build).
+        self.drawn = None;
     }
 
     // ── Input ─────────────────────────────────────────────────────────────────
 
+    /// Multiply the zoom by `factor`, keeping the logical pixel at host
+    /// offset (`rel_x`, `rel_y`) from the viewport centre where it is.
+    fn zoom_about(&mut self, factor: f32, rel_x: f32, rel_y: f32) {
+        let old = self.zoom;
+        let new = (old * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+        // src = center + rel / old  must equal  center' + rel / new
+        self.center_x += rel_x / old - rel_x / new;
+        self.center_y += rel_y / old - rel_y / new;
+        self.zoom = new;
+        self.auto_fit = false;
+    }
+
     fn handle_input(&mut self) {
-        // ── Scroll-wheel zoom, anchored to cursor position ─────────────────
+        // ── Scroll-wheel zoom, anchored to the cursor ──────────────────────
         //
-        // Wayland and X11 differ in scroll axis sign and which axis carries
-        // vertical scroll data.  We read both axes and use whichever has the
-        // larger magnitude, then treat positive = zoom in on both platforms.
-        //
-        // On X11:    Button4 (up) → scroll_y = +1.0, Button5 (down) → -1.0
-        // On Wayland: VerticalScroll positive = scroll DOWN (inverted vs X11)
-        //             Additionally, natural scrolling (common on GNOME/Fedora)
-        //             inverts again.
-        //
-        // Anchor math — keeps the logical pixel under the cursor fixed, with
-        // the cursor position measured from the origin of the panel it is in:
-        //   src = pan + rel / old_zoom
-        //   pan = src - rel / new_zoom
-        //
+        // Which axis carries vertical scroll differs between backends, so the
+        // axis with the larger magnitude is used. A positive value zooms out.
         if let Some((scroll_x, scroll_y)) = self.window.get_scroll_wheel() {
-            // Pick the axis with larger magnitude.
             let raw = if scroll_x.abs() >= scroll_y.abs() { scroll_x } else { scroll_y };
-
-            // Diagnostic: print scroll values to help debug platform
-            // differences. Remove once confirmed working.
-            #[cfg(debug_assertions)]
-            if raw.abs() > 0.001 {
-                eprintln!("[kage] scroll raw=({scroll_x:.3}, {scroll_y:.3})  using={raw:.3}");
-            }
-
             if raw.abs() > 0.05 {
-                let old_zoom = self.zoom;
-
-                let (mx, my) = self.window
+                let (mx, my) = self
+                    .window
                     .get_mouse_pos(MouseMode::Clamp)
                     .unwrap_or((self.win_w as f32 / 2.0, self.win_h as f32 / 2.0));
 
-                let rel_x = mx - self.panel_origin_x(mx);
-                let rel_y = (my - LABEL_H as f32).max(0.0);
+                // Anchor on the viewport under the cursor (or the first one).
+                let cards = self.cards();
+                let view = cards
+                    .iter()
+                    .find(|c| c.outer.contains(mx, my))
+                    .or(cards.first())
+                    .map(|c| c.view);
+                let (rel_x, rel_y) = match view {
+                    Some(v) => (
+                        mx - (v.x as f32 + v.w as f32 / 2.0),
+                        my - (v.y as f32 + v.h as f32 / 2.0),
+                    ),
+                    None => (0.0, 0.0),
+                };
 
-                // Logical pixel under cursor before zoom change.
-                let src_col = self.pan_x as f32 + rel_x / old_zoom;
-                let src_row = self.pan_y as f32 + rel_y / old_zoom;
-
-                // Multiplicative zoom: 1.2× per tick.
-                // Positive raw = scroll up on X11 → zoom in.
-                // On Wayland, if the sign is wrong the diagnostic above will show it —
-                // invert `raw` here if needed based on the printed values.
-                const ZOOM_FACTOR: f32 = 1.2;
-                if raw > 0.0 {
-                    self.zoom = (self.zoom * ZOOM_FACTOR).min(64.0);
-                } else {
-                    self.zoom = (self.zoom / ZOOM_FACTOR).max(1.0);
-                }
-
-                // Adjust pan so the same logical pixel stays under the cursor.
-                self.pan_x = (src_col - rel_x / self.zoom).round() as i32;
-                self.pan_y = (src_row - rel_y / self.zoom).round() as i32;
+                let factor = if raw > 0.0 { 1.0 / ZOOM_STEP } else { ZOOM_STEP };
+                self.zoom_about(factor, rel_x, rel_y);
             }
         }
 
-        // ── Keyboard zoom (always works, use this if scroll is misbehaving) ─
-        if self.window.is_key_pressed(Key::Equal, minifb::KeyRepeat::Yes) {
-            self.zoom = (self.zoom * 1.2).min(64.0);
+        // ── Keyboard zoom, about the viewport centre ───────────────────────
+        if self.window.is_key_pressed(Key::Equal, KeyRepeat::Yes) {
+            self.zoom_about(ZOOM_STEP, 0.0, 0.0);
         }
-        if self.window.is_key_pressed(Key::Minus, minifb::KeyRepeat::Yes) {
-            self.zoom = (self.zoom / 1.2).max(1.0);
+        if self.window.is_key_pressed(Key::Minus, KeyRepeat::Yes) {
+            self.zoom_about(1.0 / ZOOM_STEP, 0.0, 0.0);
         }
 
-        // ── Pan (arrow keys) ───────────────────────────────────────────────
-        let pan_step = 1i32;
-        if self.window.is_key_pressed(Key::Left, minifb::KeyRepeat::Yes) {
-            self.pan_x -= pan_step;
+        // ── Pan (arrow keys): one logical pixel per press ──────────────────
+        for (key, dx, dy) in [
+            (Key::Left, -1.0, 0.0),
+            (Key::Right, 1.0, 0.0),
+            (Key::Up, 0.0, -1.0),
+            (Key::Down, 0.0, 1.0),
+        ] {
+            if self.window.is_key_pressed(key, KeyRepeat::Yes) {
+                self.center_x += dx;
+                self.center_y += dy;
+                self.auto_fit = false;
+            }
         }
-        if self.window.is_key_pressed(Key::Right, minifb::KeyRepeat::Yes) {
-            self.pan_x += pan_step;
-        }
-        if self.window.is_key_pressed(Key::Up, minifb::KeyRepeat::Yes) {
-            self.pan_y -= pan_step;
-        }
-        if self.window.is_key_pressed(Key::Down, minifb::KeyRepeat::Yes) {
-            self.pan_y += pan_step;
+
+        // ── Reset ──────────────────────────────────────────────────────────
+        if self.window.is_key_pressed(Key::R, KeyRepeat::No) {
+            self.auto_fit = true;
         }
 
         // ── View toggles (each changes what is encoded for display) ────────
         let mut view_changed = false;
 
-        if self.window.is_key_pressed(Key::S, minifb::KeyRepeat::No) {
-            if self.simulated.is_some() {
-                self.simulate_mode = !self.simulate_mode;
-                view_changed = true;
-            } else {
-                eprintln!("[kage] Simulation not enabled — re-run with --simulate");
-            }
+        if self.window.is_key_pressed(Key::S, KeyRepeat::No) && self.simulated.is_some() {
+            self.simulate_mode = !self.simulate_mode;
+            view_changed = true;
         }
-        if self.window.is_key_pressed(Key::L, minifb::KeyRepeat::No) {
+        if self.window.is_key_pressed(Key::L, KeyRepeat::No) {
             self.luminance = !self.luminance;
             view_changed = true;
         }
-        if self.window.is_key_pressed(Key::E, minifb::KeyRepeat::No) {
+        if self.window.is_key_pressed(Key::E, KeyRepeat::No) {
             self.auto_exposure = !self.auto_exposure;
             view_changed = true;
         }
-        if self.window.is_key_pressed(Key::H, minifb::KeyRepeat::No) {
+        if self.window.is_key_pressed(Key::H, KeyRepeat::No) {
             self.heatmap = !self.heatmap;
-            view_changed = true;
         }
 
         if view_changed {
             self.rebuild_view();
         }
 
-        // Display mode
-        if self.window.is_key_pressed(Key::Key1, minifb::KeyRepeat::No) {
-            self.display_mode = DisplayMode::Greyscale;
-        }
-        if self.window.is_key_pressed(Key::Key2, minifb::KeyRepeat::No) {
-            self.display_mode = DisplayMode::SubpixelAa;
-        }
-        if self.window.is_key_pressed(Key::Key3, minifb::KeyRepeat::No) {
-            self.display_mode = DisplayMode::OledAware;
-        }
-        if self.window.is_key_pressed(Key::A, minifb::KeyRepeat::No) {
-            self.display_mode = DisplayMode::SideBySide;
+        // ── Display mode ───────────────────────────────────────────────────
+        for (key, mode) in [
+            (Key::Key1, DisplayMode::Greyscale),
+            (Key::Key2, DisplayMode::SubpixelAa),
+            (Key::Key3, DisplayMode::OledAware),
+            (Key::A, DisplayMode::SideBySide),
+        ] {
+            if self.window.is_key_pressed(key, KeyRepeat::No) {
+                self.display_mode = mode;
+            }
         }
 
-        // ── Mouse drag pan ─────────────────────────────────────────────────
-        //
-        // Left-click and drag pans all panels together. Pan is in whole
-        // logical pixels, so only the whole-pixel part of the drag is
-        // consumed each frame; the remainder stays in `drag_last` and
-        // accumulates, which keeps slow drags from being rounded away.
-        let mouse_down = self.window.get_mouse_down(minifb::MouseButton::Left);
-        let mouse_pos  = self.window.get_mouse_pos(MouseMode::Clamp)
-            .unwrap_or((0.0, 0.0));
+        // ── Mouse drag pan: the glyph follows the cursor ───────────────────
+        let mouse_down = self.window.get_mouse_down(MouseButton::Left);
+        let mouse_pos = self.window.get_mouse_pos(MouseMode::Clamp).unwrap_or((0.0, 0.0));
 
         if mouse_down {
-            match self.drag_last {
-                Some((last_x, last_y)) => {
-                    let dx = ((mouse_pos.0 - last_x) / self.zoom).trunc();
-                    let dy = ((mouse_pos.1 - last_y) / self.zoom).trunc();
-                    self.pan_x -= dx as i32;
-                    self.pan_y -= dy as i32;
-                    self.drag_last = Some((last_x + dx * self.zoom, last_y + dy * self.zoom));
+            if let Some((last_x, last_y)) = self.drag_last {
+                let (dx, dy) = (mouse_pos.0 - last_x, mouse_pos.1 - last_y);
+                if dx != 0.0 || dy != 0.0 {
+                    self.center_x -= dx / self.zoom;
+                    self.center_y -= dy / self.zoom;
+                    self.auto_fit = false;
                 }
-                None => self.drag_last = Some(mouse_pos),
             }
+            self.drag_last = Some(mouse_pos);
         } else {
             self.drag_last = None;
         }
     }
 
+    // ── Drawing primitives ────────────────────────────────────────────────────
+
+    fn fill_rect(&mut self, r: Rect, color: u32) {
+        let x0 = r.x.max(0) as usize;
+        let y0 = r.y.max(0) as usize;
+        let x1 = (r.x + r.w).clamp(0, self.win_w as i32) as usize;
+        let y1 = (r.y + r.h).clamp(0, self.win_h as i32) as usize;
+        if x0 >= x1 {
+            return;
+        }
+        for y in y0..y1 {
+            self.fb[y * self.win_w + x0..y * self.win_w + x1].fill(color);
+        }
+    }
+
+    /// Draw text with its top-left at (`x`, `y`); returns the end x.
+    fn text(&mut self, x: i32, y: i32, px: u32, color: u32, clip_right: i32, s: &str) -> i32 {
+        match self.text.as_mut() {
+            Some(t) => t.draw(&mut self.fb, self.win_w, self.win_h, x, y, px, color, clip_right, s),
+            None => x,
+        }
+    }
+
+    fn text_width(&mut self, px: u32, s: &str) -> i32 {
+        self.text.as_mut().map_or(0, |t| t.width(px, s))
+    }
+
+    /// Draw a small labelled box whose right edge is at `right`.
+    /// Returns the x-coordinate of its left edge.
+    fn chip_right(&mut self, right: i32, y: i32, label: &str, on: bool) -> i32 {
+        let w = self.text_width(12, label) + 16;
+        let x = right - w;
+        let (bg, fg) = if on { (CHIP_ON_BG, CHIP_ON_TEXT) } else { (CHIP_BG, TEXT_DIM) };
+        self.fill_rect(Rect { x, y, w, h: 22 }, bg);
+        self.text(x + 8, y + 4, 12, fg, right, label);
+        x
+    }
+
     // ── Drawing ───────────────────────────────────────────────────────────────
 
     fn draw(&mut self) {
-        // Clear
-        for px in self.fb.iter_mut() {
-            *px = BG_COLOR;
+        self.fb.fill(BG);
+        self.draw_header();
+        for card in self.cards() {
+            self.draw_card(card);
         }
-
-        // Draw label strip
-        for x in 0..self.win_w {
-            for y in 0..LABEL_H.min(self.win_h) {
-                self.fb[y * self.win_w + x] = LABEL_BG;
-            }
-        }
-
-        let glyph_area_h = self.win_h.saturating_sub(LABEL_H);
-
-        match self.display_mode {
-            DisplayMode::Greyscale => {
-                self.draw_panel(0, 0, LABEL_H, self.win_w, glyph_area_h);
-                self.draw_label("Greyscale AA", 0, self.win_w);
-            }
-            DisplayMode::SubpixelAa => {
-                self.draw_panel(1, 0, LABEL_H, self.win_w, glyph_area_h);
-                self.draw_label("Subpixel AA (ClearType-style)", 0, self.win_w);
-            }
-            DisplayMode::OledAware => {
-                self.draw_panel(2, 0, LABEL_H, self.win_w, glyph_area_h);
-                self.draw_label("OLED-Aware", 0, self.win_w);
-            }
-            DisplayMode::SideBySide => {
-                let col_w = self.win_w / 3;
-                let sep = 1;
-
-                // Panel 1: Greyscale
-                self.draw_panel(0, 0, LABEL_H, col_w.saturating_sub(sep), glyph_area_h);
-                self.draw_label("Greyscale AA", 0, col_w);
-
-                // Separator
-                self.draw_separator(col_w);
-
-                // Panel 2: Subpixel AA
-                self.draw_panel(1, col_w + sep, LABEL_H, col_w.saturating_sub(sep), glyph_area_h);
-                self.draw_label("Subpixel AA", col_w, col_w);
-
-                // Separator
-                self.draw_separator(col_w * 2);
-
-                // Panel 3: OLED-Aware
-                self.draw_panel(2, col_w * 2 + sep, LABEL_H, self.win_w - col_w * 2 - sep, glyph_area_h);
-                self.draw_label("OLED-Aware", col_w * 2, self.win_w - col_w * 2);
-            }
-        }
-
-        // Zoom / mode info bar at bottom
-        self.draw_status_bar();
+        self.draw_footer();
     }
 
-    /// Blit `self.shown[index]` into a rectangular region of the framebuffer.
+    /// Title, a sentence saying what is on screen, and the current view state.
+    fn draw_header(&mut self) {
+        let w = self.win_w as i32;
+        self.fill_rect(Rect { x: 0, y: 0, w, h: HEADER_H as i32 }, HEADER_BG);
+        self.fill_rect(Rect { x: 0, y: HEADER_H as i32 - 1, w, h: 1 }, BORDER);
+
+        let left = MARGIN as i32 + 2;
+        let right = w - MARGIN as i32 - 2;
+
+        // Line 1, right: what is being rendered.
+        let subject = self.config.subject.clone();
+        let subject_x = (right - self.text_width(13, &subject)).max(left);
+        self.text(subject_x, 16, 13, TEXT_DIM, right, &subject);
+
+        // Line 1, left: name and tagline.
+        let x = self.text(left, 9, 24, TEXT, subject_x - 16, "KAGE");
+        self.text(x + 12, 17, 14, TEXT_DIM, subject_x - 16, "OLED-aware subpixel text rendering inspector");
+
+        // Line 2, right: view state.
+        let chip_y = 40;
+        let simulated = self.showing_simulation();
+        let zoom_label = format!("zoom {:.1}×", self.zoom);
+        let mut cx = self.chip_right(right, chip_y, &zoom_label, false);
+        if self.heatmap {
+            cx = self.chip_right(cx - 6, chip_y, "HEATMAP", true);
+        }
+        if self.luminance {
+            cx = self.chip_right(cx - 6, chip_y, "LUMINANCE", true);
+        }
+        if simulated && !self.auto_exposure {
+            cx = self.chip_right(cx - 6, chip_y, "CLIPPED", true);
+        }
+        cx = if simulated {
+            self.chip_right(cx - 6, chip_y, "SIMULATED PANEL", true)
+        } else {
+            self.chip_right(cx - 6, chip_y, "RAW RENDER", false)
+        };
+
+        // Line 2, left: what the viewer is looking at.
+        let layout = &self.config.layout_name;
+        let line = if simulated {
+            let note = self.config.simulation_note.as_deref().unwrap_or("");
+            format!(
+                "The same glyph as a {layout} panel would emit it: every subpixel drawn where it physically sits. {note}"
+            )
+        } else if self.simulated.is_some() {
+            format!(
+                "One glyph, antialiased three ways for a {layout} display. Shown: the renderer's output, one RGB value per pixel. Press S to see it on the physical panel."
+            )
+        } else {
+            format!(
+                "One glyph, antialiased three ways for a {layout} display. Shown: the renderer's output, one RGB value per pixel."
+            )
+        };
+        self.text(left, 44, 13, TEXT, cx - 16, &line);
+    }
+
+    /// One panel: accent bar, title, description, metrics, viewport.
+    fn draw_card(&mut self, card: Card) {
+        let (name, accent, description) = PANELS[card.index];
+        let o = card.outer;
+
+        self.fill_rect(o, BORDER);
+        self.fill_rect(Rect { x: o.x + 1, y: o.y + 1, w: o.w - 2, h: o.h - 2 }, CARD_BG);
+        self.fill_rect(Rect { x: o.x, y: o.y, w: o.w, h: 3 }, accent);
+
+        let left = o.x + PAD;
+        let right = o.right() - PAD;
+        let name_end = self.text(left, o.y + 13, 17, TEXT, right, name);
+
+        // Metrics, right-aligned on the title line, when they fit.
+        if self.showing_simulation() {
+            if let Some(metrics) = self.config.metrics {
+                let m = metrics[card.index];
+                let label = format!(
+                    "luminance error {:.3}   colour fringing {:.3}",
+                    m.luminance_error, m.chroma
+                );
+                let x = right - self.text_width(12, &label);
+                if x > name_end + 16 {
+                    self.text(x, o.y + 17, 12, TEXT_DIM, right, &label);
+                }
+            }
+        }
+
+        self.text(left, o.y + 38, 12, TEXT_DIM, right, description);
+        self.fill_rect(Rect { x: o.x + 1, y: card.view.y - 1, w: o.w - 2, h: 1 }, BORDER);
+
+        self.draw_view(card);
+    }
+
+    /// Blit `self.shown[card.index]` into the card's viewport.
     ///
-    /// Each logical pixel is scaled to `zoom × zoom` host pixels, and is made
-    /// of `shown_scale × shown_scale` grid samples. Pan offsets are applied in
-    /// logical-pixel coordinates.
-    fn draw_panel(
-        &mut self,
-        index: usize,
-        panel_x: usize,
-        panel_y: usize,
-        panel_w: usize,
-        panel_h: usize,
-    ) {
+    /// Each logical pixel covers `zoom × zoom` host pixels and is made of
+    /// `shown_scale × shown_scale` grid samples. The logical point
+    /// (`center_x`, `center_y`) lands at the centre of the viewport.
+    fn draw_view(&mut self, card: Card) {
+        let v = card.view;
+        if v.w <= 0 || v.h <= 0 {
+            return;
+        }
         let zoom = self.zoom;
         let scale = self.shown_scale as f32;
-        let grid = &self.shown[index];
-        let src_w = grid.width as i32;
-        let src_h = grid.height as i32;
+        let show_lines = zoom >= 8.0;
+        let heatmap = self.heatmap;
+        let grid = &self.shown[card.index];
+        let (src_w, src_h) = (grid.width as i32, grid.height as i32);
 
-        for wy in 0..panel_h as i32 {
-            let fb_y = panel_y + wy as usize;
-            if fb_y >= self.win_h {
-                break;
+        // Host offset → (grid sample index, starts a new logical pixel).
+        let axis = |len: i32, center: f32| -> Vec<(i32, bool)> {
+            let mut prev = i32::MIN;
+            (0..len)
+                .map(|i| {
+                    let logical = center + (i as f32 + 0.5 - len as f32 / 2.0) / zoom;
+                    let cell = logical.floor() as i32;
+                    let boundary = prev != i32::MIN && cell != prev;
+                    prev = cell;
+                    ((logical * scale).floor() as i32, boundary)
+                })
+                .collect()
+        };
+        let cols = axis(v.w, self.center_x);
+        let rows = axis(v.h, self.center_y);
+
+        let (win_w, win_h) = (self.win_w as i32, self.win_h as i32);
+        for (wy, &(src_row, line_y)) in rows.iter().enumerate() {
+            let fb_y = v.y + wy as i32;
+            if fb_y < 0 || fb_y >= win_h {
+                continue;
             }
-            // Host pixel → logical pixel (pan + zoom) → grid sample (scale).
-            let ly = self.pan_y as f32 + wy as f32 / zoom;
-            let src_row = (ly * scale).floor() as i32;
-
-            for wx in 0..panel_w as i32 {
-                let fb_x = panel_x + wx as usize;
-                if fb_x >= self.win_w {
-                    break;
+            for (wx, &(src_col, line_x)) in cols.iter().enumerate() {
+                let fb_x = v.x + wx as i32;
+                if fb_x < 0 || fb_x >= win_w {
+                    continue;
                 }
-                let lx = self.pan_x as f32 + wx as f32 / zoom;
-                let src_col = (lx * scale).floor() as i32;
-
-                let color = if src_col >= 0 && src_col < src_w && src_row >= 0 && src_row < src_h {
+                let inside = src_col >= 0 && src_col < src_w && src_row >= 0 && src_row < src_h;
+                let color = if inside {
                     let px = grid.pixel(src_col as u32, src_row as u32);
-                    if self.heatmap {
+                    let color = if heatmap {
                         heatmap_color(px.r, px.g, px.b)
                     } else {
-                        let r = (px.r.clamp(0.0, 1.0) * 255.0).round() as u32;
-                        let g = (px.g.clamp(0.0, 1.0) * 255.0).round() as u32;
-                        let b = (px.b.clamp(0.0, 1.0) * 255.0).round() as u32;
-                        (0xFF << 24) | (r << 16) | (g << 8) | b
-                    }
+                        pack_rgb(px.r, px.g, px.b)
+                    };
+                    // Faint lines on logical-pixel boundaries.
+                    if show_lines && (line_x || line_y) { lighten(color, 0.10) } else { color }
                 } else {
-                    // Out-of-bounds: per-logical-pixel checkerboard to show glyph extent
-                    let checker = ((lx.floor() as i32 ^ ly.floor() as i32) & 1) == 0;
-                    if checker { 0xFF_18_18_18 } else { 0xFF_22_22_22 }
+                    VIEW_BG
                 };
-
-                self.fb[fb_y * self.win_w + fb_x] = color;
+                self.fb[(fb_y * win_w + fb_x) as usize] = color;
             }
         }
 
-        // Draw pixel grid lines when zoom is large enough to make them useful.
-        if zoom >= 8.0 {
-            self.draw_pixel_grid(panel_x, panel_y, panel_w, panel_h, zoom);
-        }
-    }
-
-    /// Draw thin grid lines on logical-pixel boundaries for easy inspection.
-    ///
-    /// A line is drawn on the first host pixel of each logical pixel, using
-    /// the same host → logical mapping as [`Self::draw_panel`], so the lines
-    /// stay on the boundaries at fractional zoom levels too.
-    fn draw_pixel_grid(
-        &mut self,
-        panel_x: usize,
-        panel_y: usize,
-        panel_w: usize,
-        panel_h: usize,
-        zoom: f32,
-    ) {
-        let grid_color = 0xFF_28_28_28;
-        let starts_pixel = |w: usize| {
-            w == 0 || (w as f32 / zoom).floor() != ((w - 1) as f32 / zoom).floor()
+        // Outline the glyph bitmap so its extent is visible against the
+        // background (the bitmap itself is mostly black).
+        let host_x = |lx: f32| v.x + (v.w as f32 / 2.0 + (lx - self.center_x) * zoom).round() as i32;
+        let host_y = |ly: f32| v.y + (v.h as f32 / 2.0 + (ly - self.center_y) * zoom).round() as i32;
+        let (gw, gh) = (src_w as f32 / scale, src_h as f32 / scale);
+        let (x0, x1) = (host_x(0.0) - 1, host_x(gw));
+        let (y0, y1) = (host_y(0.0) - 1, host_y(gh));
+        let clip = |r: Rect| {
+            let cx0 = r.x.max(v.x);
+            let cy0 = r.y.max(v.y);
+            let cx1 = (r.x + r.w).min(v.right());
+            let cy1 = (r.y + r.h).min(v.y + v.h);
+            Rect { x: cx0, y: cy0, w: (cx1 - cx0).max(0), h: (cy1 - cy0).max(0) }
         };
-        let x_end = (panel_x + panel_w).min(self.win_w);
-        let y_end = (panel_y + panel_h).min(self.win_h);
-
-        // Vertical lines — one per logical pixel column boundary.
-        for x in panel_x..x_end {
-            if starts_pixel(x - panel_x) {
-                for y in panel_y..y_end {
-                    self.fb[y * self.win_w + x] = grid_color;
-                }
-            }
-        }
-        // Horizontal lines — one per logical pixel row boundary.
-        for y in panel_y..y_end {
-            if starts_pixel(y - panel_y) {
-                for x in panel_x..x_end {
-                    self.fb[y * self.win_w + x] = grid_color;
-                }
+        for r in [
+            Rect { x: x0, y: y0, w: x1 - x0 + 1, h: 1 },
+            Rect { x: x0, y: y1, w: x1 - x0 + 1, h: 1 },
+            Rect { x: x0, y: y0, w: 1, h: y1 - y0 + 1 },
+            Rect { x: x1, y: y0, w: 1, h: y1 - y0 + 1 },
+        ] {
+            let r = clip(r);
+            if r.w > 0 && r.h > 0 {
+                self.fill_rect(r, GLYPH_OUTLINE);
             }
         }
     }
 
-    /// Draw a vertical separator at `x`.
-    fn draw_separator(&mut self, x: usize) {
-        for y in 0..self.win_h {
-            if x < self.win_w {
-                self.fb[y * self.win_w + x] = SEPARATOR_COLOR;
-            }
-        }
-    }
+    /// Key hints along the bottom edge.
+    fn draw_footer(&mut self) {
+        let w = self.win_w as i32;
+        let top = self.win_h as i32 - FOOTER_H as i32;
+        self.fill_rect(Rect { x: 0, y: top, w, h: FOOTER_H as i32 }, HEADER_BG);
+        self.fill_rect(Rect { x: 0, y: top, w, h: 1 }, BORDER);
 
-    /// Draw a simple coloured label bar along the bottom of the label strip.
-    /// Colour coding: blue = greyscale, orange = subpixel AA, green = OLED-aware.
-    /// A brighter shade indicates simulated mode is active.
-    fn draw_label(&mut self, label: &str, x_start: usize, width: usize) {
-        let accent = match label {
-            t if t.contains("Grey") => {
-                if self.simulate_mode { 0xFF_6A_B0_F5 } else { 0xFF_4A_90_D9 }
-            }
-            t if t.contains("Subpixel") || t.contains("Clear") => {
-                if self.simulate_mode { 0xFF_FF_A0_5A } else { 0xFF_E8_7B_3A }
-            }
-            _ => {
-                if self.simulate_mode { 0xFF_7A_E9_7A } else { 0xFF_5A_C9_5A }
-            }
-        };
-        let accent_y = LABEL_H.saturating_sub(3);
-        for dy in 0..3 {
-            let y = accent_y + dy;
-            for x in x_start..(x_start + width).min(self.win_w) {
-                if y < self.win_h {
-                    self.fb[y * self.win_w + x] = accent;
-                }
-            }
-        }
-    }
+        let simulate_hint = if self.simulated.is_some() { "simulated panel" } else { "simulation off" };
+        let hints = [
+            ("Scroll", "zoom"),
+            ("Drag", "pan"),
+            ("R", "reset"),
+            ("1 2 3", "one panel"),
+            ("A", "all"),
+            ("S", simulate_hint),
+            ("L", "luminance"),
+            ("E", "exposure"),
+            ("H", "heatmap"),
+            ("Esc", "quit"),
+        ];
 
-    /// Draw a one-line status bar at the very bottom of the window.
-    fn draw_status_bar(&mut self) {
-        if self.win_h < 2 { return; }
-        let bar_color = 0xFF_0A_0A_16;
-        let y = self.win_h - 1;
-        for x in 0..self.win_w {
-            self.fb[y * self.win_w + x] = bar_color;
+        let right = w - MARGIN as i32;
+        let mut x = MARGIN as i32;
+        let y = top + 9;
+        for (key, label) in hints {
+            let key_w = self.text_width(12, key) + 12;
+            let label_w = self.text_width(12, label);
+            if x + key_w + 6 + label_w > right {
+                break;
+            }
+            self.fill_rect(Rect { x, y, w: key_w, h: 20 }, CHIP_BG);
+            self.text(x + 6, y + 3, 12, TEXT, right, key);
+            x = self.text(x + key_w + 6, y + 3, 12, TEXT_DIM, right, label) + 18;
         }
     }
+}
+
+/// Pack signal-domain R/G/B in [0, 1] into `0xFF_RR_GG_BB`.
+#[inline]
+fn pack_rgb(r: f32, g: f32, b: f32) -> u32 {
+    let r = (r.clamp(0.0, 1.0) * 255.0).round() as u32;
+    let g = (g.clamp(0.0, 1.0) * 255.0).round() as u32;
+    let b = (b.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (0xFF << 24) | (r << 16) | (g << 8) | b
+}
+
+/// Move each channel of `color` towards white by `amount` in [0, 1].
+#[inline]
+fn lighten(color: u32, amount: f32) -> u32 {
+    let ch = |shift: u32| {
+        let c = ((color >> shift) & 0xFF) as f32;
+        ((c + (255.0 - c) * amount).round() as u32) << shift
+    };
+    0xFF00_0000 | ch(16) | ch(8) | ch(0)
 }
 
 /// Convert R/G/B values to a false-colour heatmap for per-channel analysis.
@@ -812,5 +1064,57 @@ mod tests {
         assert!(r == g && g == b);
         let (r, _, b) = channels(heatmap_color(0.9, 0.5, 0.1));
         assert!(r > b, "red excess should tint red");
+    }
+
+    #[test]
+    fn side_by_side_lays_out_three_equal_cards_inside_the_window() {
+        let cards = layout_cards(1280, 800, DisplayMode::SideBySide);
+        assert_eq!(cards.len(), 3);
+        assert_eq!(cards.iter().map(|c| c.index).collect::<Vec<_>>(), vec![0, 1, 2]);
+        for pair in cards.windows(2) {
+            assert_eq!(pair[0].outer.w, pair[1].outer.w);
+            assert_eq!(pair[1].outer.x - pair[0].outer.right(), GAP as i32);
+        }
+        let last = cards[2];
+        assert!(last.outer.right() <= 1280 - MARGIN as i32);
+        assert!(last.outer.y + last.outer.h <= 800 - FOOTER_H as i32);
+        assert!(last.view.y >= last.outer.y + CARD_HEAD_H as i32);
+    }
+
+    #[test]
+    fn single_mode_shows_the_selected_panel_full_width() {
+        let cards = layout_cards(1280, 800, DisplayMode::OledAware);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].index, 2);
+        assert_eq!(cards[0].outer.w, 1280 - 2 * MARGIN as i32);
+    }
+
+    #[test]
+    fn layout_survives_a_tiny_window() {
+        for card in layout_cards(10, 10, DisplayMode::SideBySide) {
+            assert!(card.outer.w >= 0 && card.outer.h >= 0);
+            assert!(card.view.w >= 0 && card.view.h >= 0);
+        }
+    }
+
+    #[test]
+    fn rect_contains_is_half_open() {
+        let r = Rect { x: 10, y: 20, w: 5, h: 5 };
+        assert!(r.contains(10.0, 20.0));
+        assert!(r.contains(14.9, 24.9));
+        assert!(!r.contains(15.0, 22.0));
+        assert!(!r.contains(9.9, 22.0));
+    }
+
+    #[test]
+    fn lighten_moves_towards_white() {
+        assert_eq!(lighten(0xFF_00_00_00, 0.0), 0xFF_00_00_00);
+        assert_eq!(lighten(0xFF_00_00_00, 1.0), 0xFF_FF_FF_FF);
+        assert_eq!(lighten(0xFF_FF_FF_FF, 0.5), 0xFF_FF_FF_FF);
+    }
+
+    #[test]
+    fn pack_rgb_clamps() {
+        assert_eq!(pack_rgb(2.0, -1.0, 0.5), 0xFF_FF_00_80);
     }
 }

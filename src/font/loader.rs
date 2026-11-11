@@ -122,6 +122,14 @@ impl FontFace {
         })
     }
 
+    /// Distance from the baseline up to the top of the line, in pixels.
+    pub fn ascent(&self) -> i32 {
+        self.face
+            .size_metrics()
+            .map(|m| (m.ascender >> 6) as i32)
+            .unwrap_or(0)
+    }
+
     /// The pixel height this face was configured with.
     pub fn pixel_size(&self) -> u32 {
         self.face

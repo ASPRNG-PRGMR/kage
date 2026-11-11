@@ -25,7 +25,7 @@ use kage::{
         SimulationParams, DEFAULT_OVERSAMPLE, DEFAULT_PSF_FWHM_ARCMIN,
     },
     subpixel::SubpixelGrid,
-    viz::{Inspector, ViewSet},
+    viz::{Inspector, InspectorConfig, PanelMetrics, ViewSet},
 };
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -67,11 +67,22 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     dpr: f32,
 
-    /// Enable Phase 2 panel simulation: physical emitter placement for the
-    /// chosen layout, then optical blur.
-    /// Press S in the inspector to toggle between raw and simulated views.
+    /// Skip the panel simulation (physical emitter placement + optical
+    /// blur). It is on by default; press S in the inspector to view it.
     #[arg(long, default_value_t = false)]
+    no_simulate: bool,
+
+    /// Accepted for compatibility; the simulation is on by default.
+    #[arg(long, default_value_t = false, hide = true)]
     simulate: bool,
+
+    /// Open the inspector showing the simulated panel instead of the raw render.
+    #[arg(long, default_value_t = false)]
+    start_simulated: bool,
+
+    /// Write the first frame of the inspector to a PPM image and exit.
+    #[arg(long, value_name = "FILE")]
+    snapshot: Option<String>,
 
     /// PSF sigma in pixel units for optical blur simulation.
     /// Overrides --viewing-dist. 0 shows the bare emitters with no blur.
@@ -188,11 +199,13 @@ fn main() {
     println!("  Layout:     {:?}", layout);
     println!("  DPI:        {} (DPR {}×)", profile.dpi, profile.device_pixel_ratio);
     println!("  HiDPI:      {}", profile.is_hidpi());
-    if args.simulate {
+    let simulate = !args.no_simulate;
+    let _ = args.simulate; // on by default; flag kept so old commands still run
+    if simulate {
         println!("  Simulate:   ON  (sigma={:.3}px, {}× oversampling)", sim_params.sigma, args.sim_scale);
         println!("  Panel:      {}", geometry.name);
     } else {
-        println!("  Simulate:   OFF  (re-run with --simulate)");
+        println!("  Simulate:   OFF  (--no-simulate)");
     }
     println!();
 
@@ -236,7 +249,8 @@ fn main() {
     println!("  Greyscale AA, Subpixel AA, OLED-Aware");
 
     // ── Simulate (linear light — emitter placement + PSF convolution) ──────────
-    let simulated = args.simulate.then(|| {
+    let mut metrics: Option<[PanelMetrics; 3]> = None;
+    let simulated = simulate.then(|| {
         let run = |grid: &SubpixelGrid| simulate_panel(grid, &geometry, &sim_params, args.sim_scale);
         let set = ViewSet {
             grey: run(&grey_raw),
@@ -251,24 +265,29 @@ fn main() {
         println!();
         println!("Simulated panel ({}×{} samples):", set.grey.width, set.grey.height);
         println!("  {:<13} {:>14} {:>14}", "", "luminance err", "chroma residue");
-        for (label, grid) in [
-            ("Greyscale AA", &set.grey),
-            ("Subpixel AA", &set.subpixel),
-            ("OLED-Aware", &set.oled),
-        ] {
+        let measure = |label: &str, grid: &SubpixelGrid| {
             let per_pixel = integrate_pixels(grid, args.sim_scale);
-            let luma_err = luminance_rms_error(&grey_raw, &per_pixel).unwrap_or(f32::NAN);
-            println!("  {:<13} {:>14.4} {:>14.4}", label, luma_err, chroma_rms(grid));
-        }
+            let m = PanelMetrics {
+                luminance_error: luminance_rms_error(&grey_raw, &per_pixel).unwrap_or(f32::NAN),
+                chroma: chroma_rms(grid),
+            };
+            println!("  {:<13} {:>14.4} {:>14.4}", label, m.luminance_error, m.chroma);
+            m
+        };
+        metrics = Some([
+            measure("Greyscale AA", &set.grey),
+            measure("Subpixel AA", &set.subpixel),
+            measure("OLED-Aware", &set.oled),
+        ]);
         set
     });
 
     println!();
     println!("Controls:");
     println!("  Scroll/+/-  zoom (anchored to cursor)");
-    println!("  Click+drag  pan");
-    println!("  Arrow keys  pan (fine)");
-    println!("  1/2/3       single panel  |  A  side-by-side");
+    println!("  Click+drag  pan            Arrow keys  pan by one pixel");
+    println!("  R           reset view");
+    println!("  1/2/3       single panel   A  side-by-side");
     println!("  S           toggle raw ↔ simulated panel");
     println!("  L           luminance-only view");
     println!("  E           auto-exposure ↔ clip (simulated view)");
@@ -282,18 +301,56 @@ fn main() {
         oled: oled_raw,
         scale: 1,
     };
-    let mut inspector = match Inspector::new(
-        &format!("KAGE — '{}' @ {}px — {:?}", args.glyph, args.size, layout),
-        raw,
-        simulated,
-        profile,
-    ) {
+    let font_name = std::path::Path::new(&font)
+        .file_stem()
+        // Variable fonts are often named like "NotoSans[wght]"; drop the axis list.
+        .map(|stem| stem.to_string_lossy().split('[').next().unwrap_or_default().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| font.clone());
+    let simulation_note = simulated.as_ref().map(|_| {
+        if sim_params.sigma > 0.0 {
+            format!(
+                "Blurred as the eye would see it (sigma {:.2} px). Zoom in to see the emitters.",
+                sim_params.sigma
+            )
+        } else {
+            "No optical blur: these are the bare emitters.".to_owned()
+        }
+    });
+    let config = InspectorConfig {
+        window_title: format!("KAGE — '{}' @ {}px — {}", args.glyph, args.size, layout.label()),
+        subject: format!("Glyph '{}'  ·  {}  ·  {} px", args.glyph, font_name, args.size),
+        layout_name: layout.label().to_owned(),
+        simulation_note,
+        metrics,
+        // Interface text always uses a system font, whatever --font is: the
+        // font under test may not have Latin letters at all.
+        ui_font: default_font().or_else(|| Some(font.clone())),
+    };
+    let mut inspector = match Inspector::new(config, raw, simulated, profile) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("Failed to open inspector window: {e}");
             std::process::exit(1);
         }
     };
+    if args.start_simulated {
+        inspector.set_simulated(true);
+    }
+
+    if let Some(path) = &args.snapshot {
+        let result = inspector.update().map_err(|e| e.to_string()).and_then(|()| {
+            inspector.save_ppm(path).map_err(|e| e.to_string())
+        });
+        match result {
+            Ok(()) => println!("Wrote snapshot to {path}"),
+            Err(e) => {
+                eprintln!("Snapshot failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     // Main event loop
     while inspector.is_open() {
