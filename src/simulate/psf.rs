@@ -35,7 +35,7 @@
 //! appear to carry less energy than they physically do. All inputs to
 //! `convolve_separable` must be linear-light [`SubpixelGrid`]s.
 
-use crate::subpixel::{SubpixelGrid, SubpixelPixel};
+use crate::subpixel::SubpixelGrid;
 
 // ── Kernel builder ────────────────────────────────────────────────────────────
 
@@ -127,38 +127,49 @@ pub fn convolve_separable_with(
     assert!(kernel_g.len() % 2 == 1, "kernel_g must have odd length");
     assert!(kernel_b.len() % 2 == 1, "kernel_b must have odd length");
 
-    let w = grid.width;
-    let h = grid.height;
-
-    // ── Pass 1: horizontal ────────────────────────────────────────────────
-    let mut horiz = SubpixelGrid::new(w, h);
-
-    for row in 0..h {
-        for col in 0..w {
-            let r = convolve1d_channel(grid, row, col, kernel_r, Channel::R, true, border);
-            let g = convolve1d_channel(grid, row, col, kernel_g, Channel::G, true, border);
-            let b = convolve1d_channel(grid, row, col, kernel_b, Channel::B, true, border);
-            *horiz.pixel_mut(col, row) = SubpixelPixel { r, g, b };
+    let (w, h) = (grid.width as usize, grid.height as usize);
+    let mut out = SubpixelGrid::new(grid.width, grid.height);
+    if w == 0 || h == 0 { return out; }
+    // Separate channels so each inner loop reads contiguous floats, with no
+    // pixel accessor or channel dispatch per tap. Keep tap addition order.
+    for (channel, kernel) in [kernel_r, kernel_g, kernel_b].into_iter().enumerate() {
+        let src: Vec<f32> = (0..h).flat_map(|y| (0..w).map(move |x| {
+            let p = grid.pixel(x as u32, y as u32);
+            [p.r, p.g, p.b][channel]
+        })).collect();
+        let radius = (kernel.len() / 2) as isize;
+        let mut horiz = vec![0.0; w * h];
+        for (input, output) in src.chunks_exact(w).zip(horiz.chunks_exact_mut(w)) {
+            for (x, value) in output.iter_mut().enumerate() {
+                for (k, weight) in kernel.iter().enumerate() {
+                    let sx = x as isize + k as isize - radius;
+                    if border == Border::Zero && (sx < 0 || sx >= w as isize) { continue; }
+                    *value += input[sx.clamp(0, w as isize - 1) as usize] * weight;
+                }
+            }
+        }
+        let mut vert = vec![0.0; w * h];
+        for (y, output) in vert.chunks_exact_mut(w).enumerate() {
+            for (k, weight) in kernel.iter().enumerate() {
+                let sy = y as isize + k as isize - radius;
+                if border == Border::Zero && (sy < 0 || sy >= h as isize) { continue; }
+                let row = sy.clamp(0, h as isize - 1) as usize * w;
+                for (value, sample) in output.iter_mut().zip(&horiz[row..row + w]) {
+                    *value += sample * weight;
+                }
+            }
+        }
+        for (i, value) in vert.into_iter().enumerate() {
+            let p = out.pixel_mut((i % w) as u32, (i / w) as u32);
+            match channel { 0 => p.r = value, 1 => p.g = value, _ => p.b = value }
         }
     }
-
-    // ── Pass 2: vertical ──────────────────────────────────────────────────
-    let mut vert = SubpixelGrid::new(w, h);
-
-    for row in 0..h {
-        for col in 0..w {
-            let r = convolve1d_channel(&horiz, row, col, kernel_r, Channel::R, false, border);
-            let g = convolve1d_channel(&horiz, row, col, kernel_g, Channel::G, false, border);
-            let b = convolve1d_channel(&horiz, row, col, kernel_b, Channel::B, false, border);
-            *vert.pixel_mut(col, row) = SubpixelPixel { r, g, b };
-        }
-    }
-
-    vert
+    out
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 enum Channel { R, G, B }
 
@@ -166,6 +177,7 @@ enum Channel { R, G, B }
 ///
 /// `horizontal = true`  → convolve along the row (vary col).
 /// `horizontal = false` → convolve along the column (vary row).
+#[cfg(test)]
 fn convolve1d_channel(
     grid: &SubpixelGrid,
     row: u32,
@@ -223,6 +235,34 @@ mod tests {
             }
         }
         g
+    }
+
+    #[test]
+    fn channel_rows_match_scalar_reference_including_small_images_and_borders() {
+        for (w, h) in [(0, 0), (1, 1), (1, 7), (9, 1), (13, 9)] {
+            let mut grid = SubpixelGrid::new(w, h);
+            for y in 0..h { for x in 0..w {
+                *grid.pixel_mut(x, y) = SubpixelPixel { r: (x + y) as f32 / 20.0, g: (x * y) as f32 / 120.0, b: (x % 3) as f32 / 3.0 };
+            } }
+            let kernels = [gaussian_kernel(0.7, 2), gaussian_kernel(1.5, 5), gaussian_kernel(2.0, 6)];
+            for border in [Border::Clamp, Border::Zero] {
+                let actual = convolve_separable_with(&grid, &kernels[0], &kernels[1], &kernels[2], border);
+                let mut horizontal = SubpixelGrid::new(w, h);
+                for y in 0..h { for x in 0..w {
+                    let [r, g, b] = [Channel::R, Channel::G, Channel::B].map(|c| {
+                        convolve1d_channel(&grid, y, x, &kernels[c as usize], c, true, border)
+                    });
+                    *horizontal.pixel_mut(x, y) = SubpixelPixel { r, g, b };
+                } }
+                for y in 0..h { for x in 0..w {
+                    let p = actual.pixel(x, y);
+                    for (c, v) in [(Channel::R, p.r), (Channel::G, p.g), (Channel::B, p.b)] {
+                        let expected = convolve1d_channel(&horizontal, y, x, &kernels[c as usize], c, false, border);
+                        assert!((v - expected).abs() < 1e-6);
+                    }
+                } }
+            }
+        }
     }
 
     #[test]

@@ -270,6 +270,7 @@ impl Gpu {
 pub(crate) mod tests {
     use super::*;
     use crate::plane::Plane;
+    #[cfg(any(feature = "opengl", feature = "vulkan"))]
     use crate::render::render_coverage;
 
     #[test]
@@ -313,6 +314,7 @@ pub(crate) mod tests {
 
     /// A glyph-like test pattern: a ring and a slanted bar, antialiased at
     /// the fine resolution.
+    #[cfg(any(feature = "opengl", feature = "vulkan"))]
     pub(crate) fn test_coverage(scale: u32) -> Coverage {
         let (w, h) = (13 * scale, 11 * scale);
         let hi = Plane::from_fn(w, h, |sx, sy| {
@@ -327,6 +329,7 @@ pub(crate) mod tests {
 
     /// Render every mode on every layout with `renderer` and compare with
     /// the CPU. Shared by the backend tests.
+    #[cfg(any(feature = "opengl", feature = "vulkan"))]
     pub(crate) fn assert_matches_cpu(renderer: &mut dyn GpuRenderer) {
         let profile = DisplayProfile::sdr_oled();
         let settings = [
