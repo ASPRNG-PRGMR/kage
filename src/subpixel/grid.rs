@@ -8,14 +8,15 @@
 //! The grid is the intermediate representation between the rendered glyph and
 //! the final display framebuffer.  It can be:
 //! - Displayed directly (zoom + inspect)
-//! - Passed to a display simulator (Phase 2)
+//! - Passed to the display simulator ([`crate::simulate`])
 //! - Encoded with the panel's EOTF and composited into a framebuffer
 
 use crate::glyph::GlyphBuffer;
 use crate::layout::{
-    pentile::{adaptive_blend, chromatic_penalty, filter_row},
-    SubpixelLayout,
+    pentile::{adaptive_blend, chromatic_penalty},
+    BaseFilter, FilterKernel, SubpixelLayout,
 };
+use crate::plane::Plane;
 
 // ── SubpixelGrid ──────────────────────────────────────────────────────────────
 
@@ -55,90 +56,70 @@ impl SubpixelGrid {
         &mut self.pixels[(row * self.width + col) as usize]
     }
 
+    /// Build a grid from interleaved `[r, g, b, _]` values, four per pixel
+    /// (the format the GPU backends read back).
+    pub fn from_rgba(width: u32, height: u32, rgba: &[f32]) -> Self {
+        assert_eq!(rgba.len(), (width * height * 4) as usize, "rgba length must be width*height*4");
+        Self {
+            width,
+            height,
+            pixels: rgba
+                .chunks_exact(4)
+                .map(|px| SubpixelPixel { r: px[0], g: px[1], b: px[2] })
+                .collect(),
+        }
+    }
+
+    /// Apply a layout filter to a coverage plane.
+    ///
+    /// Each channel samples the coverage through `filter`'s kernel, which
+    /// places the sampling point at that channel's emitter. Taps outside the
+    /// plane clamp to the edge, so glyphs of any width are filtered.
+    pub fn from_coverage(cov: &Plane, filter: BaseFilter) -> Self {
+        Self::from_kernel(cov, &filter.kernel())
+    }
+
+    /// Apply explicit filter taps to a coverage plane.
+    pub fn from_kernel(cov: &Plane, kernel: &FilterKernel) -> Self {
+        let mut grid = SubpixelGrid::new(cov.width, cov.height);
+        for row in 0..cov.height {
+            for col in 0..cov.width {
+                let [r, g, b] = kernel.sample(cov, col, row);
+                *grid.pixel_mut(col, row) = SubpixelPixel { r, g, b };
+            }
+        }
+        grid
+    }
+
     /// Build a [`SubpixelGrid`] from a rendered [`GlyphBuffer`] and a display layout.
     ///
-    /// The alpha channel of the buffer is used as the coverage signal fed into
-    /// the per-layout filter.  The filter produces per-channel R/G/B values
-    /// which are then optionally blended with greyscale via the adaptive fringe
-    /// suppressor.
+    /// The alpha channel of the buffer is the coverage signal fed into the
+    /// layout's filter ([`BaseFilter::for_layout`]).
     ///
-    /// `fringe_suppress`: when `true`, the adaptive chromatic penalty is applied
-    /// to reduce colour fringing at high-contrast edges.
+    /// `fringe_suppress` applies the Phase 1 fringe suppressor — a blend
+    /// towards green driven by the row Laplacian — on Pentile RGBG. The
+    /// OLED-aware renderer no longer uses it; see
+    /// [`crate::render::perceptual`] for its replacement, which works on
+    /// every layout.
     pub fn from_glyph(
         buf: &GlyphBuffer,
         layout: SubpixelLayout,
         fringe_suppress: bool,
     ) -> Self {
-        let w = buf.width;
-        let h = buf.height;
-        let mut grid = SubpixelGrid::new(w, h);
+        let cov = Plane::from_coverage(buf);
+        let mut grid = Self::from_coverage(&cov, BaseFilter::for_layout(layout));
 
-        for row in 0..h {
-            // Extract the coverage (alpha) row as a slice of f32.
-            let coverage: Vec<f32> = (0..w)
-                .map(|col| buf.pixel(col, row)[3])
-                .collect();
-
-            let mut out_r = vec![0.0f32; w as usize];
-            let mut out_g = vec![0.0f32; w as usize];
-            let mut out_b = vec![0.0f32; w as usize];
-
-            match layout {
-                SubpixelLayout::Greyscale | SubpixelLayout::Wrgb => {
-                    // Greyscale: all channels equal coverage.
-                    for col in 0..w as usize {
-                        out_r[col] = coverage[col];
-                        out_g[col] = coverage[col];
-                        out_b[col] = coverage[col];
-                    }
+        if fringe_suppress && layout == SubpixelLayout::PentileRgbg {
+            let w = cov.width as usize;
+            for row in 0..cov.height {
+                let coverage = &cov.data[row as usize * w..(row as usize + 1) * w];
+                for col in 0..w {
+                    let penalty = chromatic_penalty(coverage, col);
+                    let px = grid.pixel_mut(col as u32, row);
+                    // Green carries luminance.
+                    let [r, g, b] = adaptive_blend(px.r, px.g, px.b, px.g, penalty);
+                    *px = SubpixelPixel { r, g, b };
                 }
-
-                SubpixelLayout::RgbStripe => {
-                    // Standard ClearType-style horizontal shift.
-                    // R lags by 1/3 pixel, G is centred, B leads by 1/3 pixel.
-                    // We approximate this with a 3-tap displacement FIR.
-                    rgb_stripe_filter_row(&coverage, &mut out_r, &mut out_g, &mut out_b);
-                }
-
-                SubpixelLayout::BgrStripe => {
-                    // Same as RGB but R and B are swapped.
-                    rgb_stripe_filter_row(&coverage, &mut out_b, &mut out_g, &mut out_r);
-                }
-
-                SubpixelLayout::PentileRgbg => {
-                    let row_parity = (row & 1) as u8;
-                    filter_row(&coverage, row_parity, &mut out_r, &mut out_g, &mut out_b);
-
-                    if fringe_suppress {
-                        for col in 0..w as usize {
-                            let penalty = chromatic_penalty(&coverage, col);
-                            let grey = out_g[col]; // green carries luminance
-                            let [r2, g2, b2] =
-                                adaptive_blend(out_r[col], out_g[col], out_b[col], grey, penalty);
-                            out_r[col] = r2;
-                            out_g[col] = g2;
-                            out_b[col] = b2;
-                        }
-                    }
-                }
-
-                SubpixelLayout::DeltaRgb => {
-                    // Delta-RGB (QD-OLED) requires a 2-D kernel — not implemented yet.
-                    // Fall back to greyscale for now; Phase 3 will add the full kernel.
-                    for col in 0..w as usize {
-                        out_r[col] = coverage[col];
-                        out_g[col] = coverage[col];
-                        out_b[col] = coverage[col];
-                    }
-                }
-            }
-
-            // Write results into grid.
-            for col in 0..w {
-                let px = grid.pixel_mut(col, row);
-                px.r = out_r[col as usize];
-                px.g = out_g[col as usize];
-                px.b = out_b[col as usize];
             }
         }
 
@@ -160,42 +141,6 @@ impl SubpixelGrid {
                 (0xFF << 24) | (r << 16) | (g << 8) | b
             })
             .collect()
-    }
-}
-
-// ── RGB stripe filter ─────────────────────────────────────────────────────────
-
-/// 3-tap horizontal displacement filter for RGB/BGR stripe panels.
-///
-/// Simulates ClearType-style phase-shifted sampling: each colour channel
-/// samples the coverage waveform at a slightly different horizontal position,
-/// corresponding to the physical subpixel offset within the logical pixel.
-///
-/// Taps approximate the subpixel offsets:
-/// - Left channel (R for RGB):  weighted toward the left neighbour
-/// - Centre channel (G):        centred
-/// - Right channel (B for RGB): weighted toward the right neighbour
-///
-/// For BGR panels, the caller passes out_b and out_r in swapped argument positions.
-fn rgb_stripe_filter_row(
-    coverage: &[f32],
-    out_left: &mut [f32],
-    out_centre: &mut [f32],
-    out_right: &mut [f32],
-) {
-    let n = coverage.len();
-    // Taps outside the row use clamp-to-edge, so every column is written and
-    // glyphs narrower than the kernel are still filtered.
-    for i in 0..n {
-        let cl = coverage[i.saturating_sub(1)];
-        let cc = coverage[i];
-        let cr = coverage[(i + 1).min(n - 1)];
-        // Left-phase tap (R): emphasises left neighbour
-        out_left[i]   = 0.30 * cl + 0.60 * cc + 0.10 * cr;
-        // Centre tap (G): symmetric gentle sharpening
-        out_centre[i] = 0.11 * cl + 0.78 * cc + 0.11 * cr;
-        // Right-phase tap (B): emphasises right neighbour
-        out_right[i]  = 0.10 * cl + 0.60 * cc + 0.30 * cr;
     }
 }
 
@@ -250,6 +195,28 @@ mod tests {
     }
 
     #[test]
+    fn delta_layout_is_no_longer_greyscale() {
+        // A hard horizontal edge: the delta kernel separates green from
+        // red and blue across it.
+        let mut buf = GlyphBuffer::new(4, 6);
+        for row in 3..6 {
+            for col in 0..4 {
+                buf.pixel_mut(col, row)[3] = 1.0;
+            }
+        }
+        let grid = SubpixelGrid::from_glyph(&buf, SubpixelLayout::DeltaRgb, false);
+        let px = grid.pixel(1, 2);
+        assert!((px.r - px.g).abs() > 0.1, "expected colour separation, got {px:?}");
+    }
+
+    #[test]
+    fn from_rgba_drops_the_fourth_component() {
+        let grid = SubpixelGrid::from_rgba(2, 1, &[0.1, 0.2, 0.3, 9.0, 0.4, 0.5, 0.6, 9.0]);
+        let px = grid.pixel(1, 0);
+        assert_eq!((px.r, px.g, px.b), (0.4, 0.5, 0.6));
+    }
+
+    #[test]
     fn to_argb8_white() {
         let buf = uniform_buffer(2, 2, 1.0);
         let grid = SubpixelGrid::from_glyph(&buf, SubpixelLayout::Greyscale, false);
@@ -276,6 +243,7 @@ mod tests {
             SubpixelLayout::RgbStripe,
             SubpixelLayout::BgrStripe,
             SubpixelLayout::PentileRgbg,
+            SubpixelLayout::DeltaRgb,
         ] {
             for w in 1u32..=2 {
                 let buf = uniform_buffer(w, 3, 1.0);

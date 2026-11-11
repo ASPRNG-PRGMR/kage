@@ -72,6 +72,10 @@ pub const RED_FIR: [f32; 3] = [0.25, 0.50, 0.25];
 /// Identical shape to red — blue has the same geometry (half-res, staggered).
 pub const BLUE_FIR: [f32; 3] = [0.25, 0.50, 0.25];
 
+/// Taps for red or blue in a pixel that has no emitter of that colour: the
+/// mean of the two horizontal neighbours, which both have one.
+pub const ABSENT_FIR: [f32; 3] = [0.5, 0.0, 0.5];
+
 /// Apply per-channel FIR filtering to a horizontal strip of coverage values.
 ///
 /// # Parameters
