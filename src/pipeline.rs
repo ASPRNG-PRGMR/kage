@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 
 use crate::coverage::{Coverage, GlyphMetrics};
 use crate::font::FontFace;
+use crate::gpu::{Backend, Gpu, RenderJob};
 use crate::layout::{EmitterMap, SubpixelLayout};
 use crate::plane::Plane;
 use crate::profile::DisplayProfile;
@@ -73,6 +74,7 @@ pub struct PipelineConfig {
 /// The settings that can change while the inspector is open.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tuning {
+    pub backend: Backend,
     pub render: RenderParams,
     /// Eye-to-panel distance. Sets the optical blur (unless fixed) and the
     /// scale of the chromatic low-pass in the visible-chroma metric.
@@ -82,6 +84,9 @@ pub struct Tuning {
 /// One evaluation of the pipeline.
 #[derive(Debug, Clone)]
 pub struct Output {
+    pub backend: Backend,
+    pub device: String,
+    pub backend_error: Option<String>,
     /// Renderer output, linear light, one sample per pixel.
     pub raw: ViewSet,
     /// Simulated panel image, linear light (`None` if simulation is off).
@@ -114,6 +119,7 @@ pub struct Pipeline {
     /// Greyscale and Subpixel AA output: independent of every setting.
     fixed: [SubpixelGrid; 2],
     cache: Option<ViewCache>,
+    gpu: Gpu,
 }
 
 impl Pipeline {
@@ -137,7 +143,7 @@ impl Pipeline {
         let fixed = [RenderMode::Greyscale, RenderMode::SubpixelAa].map(|mode| {
             render_coverage(&coverage, mode, config.layout, &map, &config.profile, &RenderParams::default())
         });
-        Ok(Self { config, coverage, reference, map, fixed, cache: None })
+        Ok(Self { config, coverage, reference, map, fixed, cache: None, gpu: Gpu::new() })
     }
 
     /// Rasterize `ch` from `face` and build a pipeline for it.
@@ -209,18 +215,55 @@ impl Pipeline {
             return;
         }
         let reference = simulate_ideal(&self.reference, &sim, self.config.sim_scale.max(1));
+        // Baseline simulations use CPU grids: GPU rounding (~1e-7) is
+        // immaterial to metrics and must not invalidate this cache.
         let grey = self.simulate(&self.fixed[0], &sim, &reference, chroma_sigma);
         let subpixel = self.simulate(&self.fixed[1], &sim, &reference, chroma_sigma);
         self.cache = Some(ViewCache { sigma: sim.sigma, chroma_sigma, reference, grey, subpixel });
     }
 
-    /// Render and (if enabled) simulate and score everything for `tuning`,
-    /// with the OLED-aware grid computed on the CPU.
+    /// Render all three modes, excluding backend initialisation from timing.
+    /// A failed GPU run is discarded in full and recomputed on the CPU.
     pub fn run(&mut self, tuning: &Tuning) -> Output {
+        let mut backend_error = None;
+        if tuning.backend != Backend::Cpu {
+            match self.gpu.renderer(tuning.backend) {
+                Ok(renderer) => {
+                    let device = renderer.device().to_owned();
+                    let start = Instant::now();
+                    let grids: Result<Vec<_>, String> = RenderMode::ALL.iter().map(|&mode| {
+                        let job = RenderJob::new(&self.coverage, mode, self.config.layout,
+                            &self.map, &self.config.profile, &tuning.render)?;
+                        renderer.render(&job)
+                    }).collect();
+                    let elapsed = start.elapsed();
+                    match grids {
+                        Ok(mut grids) => {
+                            let oled = grids.pop().unwrap();
+                            let subpixel = grids.pop().unwrap();
+                            let grey = grids.pop().unwrap();
+                            let mut out = self.run_with(tuning, oled, elapsed);
+                            out.raw.grey = grey;
+                            out.raw.subpixel = subpixel;
+                            out.backend = tuning.backend;
+                            out.device = device;
+                            return out;
+                        }
+                        Err(e) => backend_error = Some(e),
+                    }
+                }
+                Err(e) => backend_error = Some(e),
+            }
+        }
         let start = Instant::now();
-        let oled = self.render_oled(&tuning.render);
-        let render_time = start.elapsed();
-        self.run_with(tuning, oled, render_time)
+        let [grey, subpixel, oled] = RenderMode::ALL.map(|mode| render_coverage(
+            &self.coverage, mode, self.config.layout, &self.map, &self.config.profile, &tuning.render));
+        let elapsed = start.elapsed();
+        let mut out = self.run_with(tuning, oled, elapsed);
+        out.raw.grey = grey;
+        out.raw.subpixel = subpixel;
+        out.backend_error = backend_error;
+        out
     }
 
     /// As [`run`](Self::run), with the OLED-aware grid supplied by the
@@ -229,7 +272,7 @@ impl Pipeline {
         let sigma = self.sigma(tuning.viewing_distance_mm).max(0.0);
         let raw = ViewSet { grey: self.fixed[0].clone(), subpixel: self.fixed[1].clone(), oled, scale: 1 };
         if !self.config.simulate {
-            return Output { raw, simulated: None, metrics: None, sigma, render_time };
+            return Output { backend: Backend::Cpu, device: "CPU software renderer".into(), backend_error: None, raw, simulated: None, metrics: None, sigma, render_time };
         }
         self.prepare(tuning.viewing_distance_mm);
         let cache = self.cache.as_ref().expect("prepare() fills the cache");
@@ -242,7 +285,7 @@ impl Pipeline {
             scale: self.config.sim_scale.max(1),
         };
         let metrics = [cache.grey.1, cache.subpixel.1, oled_metrics];
-        Output { raw, simulated: Some(simulated), metrics: Some(metrics), sigma, render_time }
+        Output { backend: Backend::Cpu, device: "CPU software renderer".into(), backend_error: None, raw, simulated: Some(simulated), metrics: Some(metrics), sigma, render_time }
     }
 
     /// Luminance error plus visible chroma of the OLED-aware renderer with
@@ -341,7 +384,30 @@ mod tests {
     }
 
     fn tuning() -> Tuning {
-        Tuning { render: RenderParams::default(), viewing_distance_mm: 500.0 }
+        Tuning { backend: Backend::Cpu, render: RenderParams::default(), viewing_distance_mm: 500.0 }
+    }
+
+    #[test]
+    fn backend_metrics_match_or_report_cpu_fallback() {
+        for layout in SubpixelLayout::ALL {
+            let mut p = pipeline(layout, true);
+            let cpu = p.run(&tuning());
+            for backend in [Backend::OpenGl, Backend::Vulkan] {
+                let out = p.run(&Tuning { backend, ..tuning() });
+                if let Some(error) = &out.backend_error {
+                    eprintln!("{backend} fallback: {error}");
+                    assert_eq!(out.backend, Backend::Cpu);
+                    assert!(!error.is_empty());
+                } else {
+                    assert_eq!(out.backend, backend);
+                }
+                for (a, b) in cpu.metrics.unwrap().iter().zip(out.metrics.unwrap()) {
+                    assert!((a.luminance_error - b.luminance_error).abs() < 1e-4);
+                    assert!((a.visible_chroma - b.visible_chroma).abs() < 1e-4);
+                    assert!((a.chroma - b.chroma).abs() < 1e-4);
+                }
+            }
+        }
     }
 
     #[test]
@@ -395,7 +461,7 @@ mod tests {
     fn auto_tune_never_makes_the_objective_worse() {
         for layout in [SubpixelLayout::RgbStripe, SubpixelLayout::PentileRgbg, SubpixelLayout::DeltaRgb] {
             let mut p = pipeline(layout, true);
-            let start = Tuning { render: RenderParams { luma_footprint: 0.5, chroma_footprint: 2.0, edge_suppression: 0.0 }, viewing_distance_mm: 500.0 };
+            let start = Tuning { backend: Backend::Cpu, render: RenderParams { luma_footprint: 0.5, chroma_footprint: 2.0, edge_suppression: 0.0 }, viewing_distance_mm: 500.0 };
             let before = p.objective(&start.render, 500.0).unwrap();
             let tuned = p.auto_tune(&start).unwrap();
             let after = p.objective(&tuned, 500.0).unwrap();
@@ -414,5 +480,14 @@ mod tests {
         let mut cfg = config(SubpixelLayout::PentileRgbg, true);
         cfg.geometry.cell_w = 3;
         assert!(Pipeline::new(cfg, Coverage::from_hi(stroke(4), 4), stroke(SIM)).is_err());
+    }
+}
+
+/// One sentence describing the optical blur for the inspector header.
+pub fn simulation_note(sigma: f32) -> String {
+    if sigma > 0.0 {
+        format!("Blurred as the eye would see it (sigma {sigma:.2} px). Zoom in to see the emitters.")
+    } else {
+        "No optical blur: these are the bare emitters.".to_owned()
     }
 }

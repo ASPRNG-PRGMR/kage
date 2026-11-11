@@ -17,8 +17,9 @@
 use clap::Parser;
 use kage::{
     font::FontFace,
+    gpu::Backend,
     layout::SubpixelLayout,
-    pipeline::{Pipeline, PipelineConfig, Tuning, DEFAULT_SUPERSAMPLE},
+    pipeline::{simulation_note, Pipeline, PipelineConfig, Tuning, DEFAULT_SUPERSAMPLE},
     profile::DisplayProfile,
     render::{csf, RenderParams},
     simulate::{BleedProfile, PanelDescription, PanelGeometry, DEFAULT_OVERSAMPLE, DEFAULT_PSF_FWHM_ARCMIN},
@@ -34,6 +35,10 @@ use kage::{
     version
 )]
 struct Args {
+    /// Rendering backend (falls back to CPU if unavailable).
+    #[arg(long, default_value = "cpu", value_parser = ["cpu", "opengl", "vulkan"])]
+    backend: String,
+
     /// Path to a TrueType / OpenType font file. Defaults to the system's
     /// sans-serif font.
     #[arg(short, long)]
@@ -261,7 +266,7 @@ fn main() {
     if args.no_fringe {
         render.edge_suppression = 0.0;
     }
-    let mut tuning = Tuning { render: render.clamped(), viewing_distance_mm: args.viewing_dist };
+    let mut tuning = Tuning { backend: Backend::from_name(&args.backend).unwrap(), render: render.clamped(), viewing_distance_mm: args.viewing_dist };
     if args.auto_tune {
         match pipeline.auto_tune(&tuning) {
             Some(best) => tuning.render = best,
@@ -278,6 +283,8 @@ fn main() {
 
     // ── Render, simulate, score ────────────────────────────────────────────────
     let output = pipeline.run(&tuning);
+    println!("Backend: {} — {} — {:.3} ms (three modes)", output.backend, output.device, output.render_time.as_secs_f64() * 1000.0);
+    if let Some(error) = &output.backend_error { eprintln!("Warning: {} failed; using CPU: {error}", tuning.backend); }
     if let (Some(set), Some(metrics)) = (&output.simulated, &output.metrics) {
         println!();
         println!(
@@ -351,11 +358,3 @@ fn main() {
     }
 }
 
-/// One sentence about the optical blur, for the inspector's header.
-fn simulation_note(sigma: f32) -> String {
-    if sigma > 0.0 {
-        format!("Blurred as the eye would see it (sigma {sigma:.2} px). Zoom in to see the emitters.")
-    } else {
-        "No optical blur: these are the bare emitters.".to_owned()
-    }
-}
