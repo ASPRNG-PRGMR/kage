@@ -16,41 +16,52 @@
 //!
 //! KAGE addresses this by:
 //!
-//! 1. **Layout-aware filter kernels** — per-layout FIR taps that match subpixel geometry
-//! 2. **Adaptive fringe suppression** — blending subpixel-rendered channels with a
-//!    greyscale fallback at high-contrast edges, where chromatic penalty exceeds gain
-//! 3. **Display profile integration** — EOTF-correct encoding and DPI-adaptive decisions
+//! 1. **Sampling at the emitter** — each colour of each pixel takes the
+//!    glyph's coverage where that colour's emitter physically sits, read
+//!    from supersampled coverage and a description of the panel
+//! 2. **Simulating the panel** — emitters at their real positions, optical
+//!    blur, per-colour bleed — and scoring every renderer against what an
+//!    ideal display would show
+//! 3. **Display profile integration** — EOTF-correct encoding and
+//!    DPI-adaptive decisions
 //!
 //! ## Architecture
 //!
 //! ```text
-//! font::loader  →  glyph::GlyphBuffer  →  render::{grayscale,subpixel_aa,oled_aware}
-//!                                                  ↓
-//!                                       subpixel::SubpixelGrid  (linear light)
-//!                                          ↓                ↓
-//!                                          │     simulate::simulate_panel
-//!                                          │     (emitter placement + PSF blur)
-//!                                          ↓                ↓
-//!                                         viz::Inspector  (EOTF-encodes, minifb window)
+//! font::loader ──▶ coverage::Coverage ──▶ render::{grayscale, subpixel_aa, oled_aware}
+//!                  (pixel + supersampled)              ↓
+//!                                         subpixel::SubpixelGrid  (linear light)
+//!                                            ↓                ↓
+//!                                            │     simulate::simulate_panel
+//!                                            │     (emitter placement + PSF blur)
+//!                                            ↓                ↓
+//!                                           viz::Inspector  (EOTF-encodes, minifb window)
 //! ```
 //!
-//! ## Status — Phases 1, 1.5 and 2 complete
+//! [`pipeline::Pipeline`] runs that chain and computes the metrics.
 //!
-//! Implemented:
+//! ## Status — Phases 1 to 3 complete
+//!
 //! - `profile`   — display EOTF, white point, DPI
-//! - `layout`    — subpixel layout enum, pentile RGBG geometry and kernels
-//! - `glyph`     — output buffer type (linear-light RGBA f32)
-//! - `font`      — FreeType font loading and rasterization (grey + LCD modes)
-//! - `subpixel`  — virtual subpixel grid, layout-aware filtering
-//! - `render`    — three rendering strategies: greyscale, subpixel AA, OLED-aware
-//! - `simulate`  — physical subpixel geometry, optical PSF blur, per-channel
-//!   bleed, gamma-aware luminance reconstruction and metrics
+//! - `layout`    — subpixel layouts, fixed filter kernels (stripe, Pentile,
+//!   Delta-RGB) and per-pixel emitter positions
+//! - `glyph`     — pixel buffer type (linear-light RGBA f32)
+//! - `plane`     — single-channel image with clamp-to-edge sampling
+//! - `coverage`  — glyph coverage at pixel resolution and supersampled
+//! - `font`      — FreeType font loading and rasterization
+//! - `subpixel`  — virtual subpixel grid, kernel filtering
+//! - `render`    — three rendering strategies: greyscale, subpixel AA,
+//!   OLED-aware; contrast-sensitivity model
+//! - `simulate`  — physical subpixel geometry (built-in or from `.toml`),
+//!   optical PSF blur, per-channel bleed, luminance reconstruction, metrics
+//! - `pipeline`  — glyph → renderers → simulation → metrics, auto-tuning
 //! - `viz`       — zoomable subpixel inspector (minifb) with raw / simulated views
 
 pub mod coverage;
 pub mod font;
 pub mod glyph;
 pub mod layout;
+pub mod pipeline;
 pub mod plane;
 pub mod profile;
 pub mod render;

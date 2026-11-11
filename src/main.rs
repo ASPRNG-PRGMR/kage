@@ -18,14 +18,11 @@ use clap::Parser;
 use kage::{
     font::FontFace,
     layout::SubpixelLayout,
+    pipeline::{Pipeline, PipelineConfig, Tuning, DEFAULT_SUPERSAMPLE},
     profile::DisplayProfile,
-    render::{render, RenderMode},
-    simulate::{
-        chroma_rms, integrate_pixels, luminance_rms_error, simulate_panel, PanelGeometry,
-        SimulationParams, DEFAULT_OVERSAMPLE, DEFAULT_PSF_FWHM_ARCMIN,
-    },
-    subpixel::SubpixelGrid,
-    viz::{Inspector, InspectorConfig, PanelMetrics, ViewSet},
+    render::{csf, RenderParams},
+    simulate::{BleedProfile, PanelDescription, PanelGeometry, DEFAULT_OVERSAMPLE, DEFAULT_PSF_FWHM_ARCMIN},
+    viz::{Inspector, InspectorConfig},
 };
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -37,90 +34,105 @@ use kage::{
     version
 )]
 struct Args {
-    /// Path to a TrueType or OpenType font file.
-    /// Defaults to the system's sans-serif font (see `default_font`).
+    /// Path to a TrueType / OpenType font file. Defaults to the system's
+    /// sans-serif font.
     #[arg(short, long)]
     font: Option<String>,
 
-    /// Unicode character to render (single character).
+    /// Character to render.
     #[arg(short, long, default_value = "A")]
     glyph: char,
 
-    /// Subpixel layout of the target display.
-    /// One of: rgb, bgr, pentile, delta, wrgb, grey
+    /// Subpixel layout: rgb | bgr | pentile | delta | wrgb | grey.
     #[arg(short, long, default_value = "pentile")]
     layout: String,
 
-    /// Render size in device pixels (cap height).
+    /// Panel description file (.toml) with emitter geometry and bleed.
+    /// Replaces the layout's nominal geometry; see layouts/README.md.
+    #[arg(long, value_name = "FILE")]
+    panel: Option<String>,
+
+    /// Glyph pixel size.
     #[arg(short, long, default_value_t = 64)]
     size: u32,
 
-    /// Disable adaptive fringe suppression in the OLED-aware renderer.
+    /// Coverage samples per pixel per axis given to the renderers (1–8).
+    /// 1 disables supersampling.
+    #[arg(long, default_value_t = DEFAULT_SUPERSAMPLE, value_parser = clap::value_parser!(u32).range(1..=8))]
+    supersample: u32,
+
+    /// OLED-aware: footprint width of green / white emitters, in pixels.
+    #[arg(long, value_name = "PX")]
+    luma_footprint: Option<f32>,
+
+    /// OLED-aware: footprint width of red / blue emitters, in pixels.
+    #[arg(long, value_name = "PX")]
+    chroma_footprint: Option<f32>,
+
+    /// OLED-aware: how far red / blue move to the luminance footprint at
+    /// strong edges (0–1).
+    #[arg(long, value_name = "K")]
+    edge_suppression: Option<f32>,
+
+    /// Search for the OLED-aware settings with the lowest simulated error
+    /// for this glyph, panel and viewing distance.
     #[arg(long, default_value_t = false)]
+    auto_tune: bool,
+
+    /// Accepted for compatibility: sets --edge-suppression 0.
+    #[arg(long, default_value_t = false, hide = true)]
     no_fringe: bool,
 
-    /// Display DPI (affects HiDPI fallback threshold).
+    /// Display DPI (used for the HiDPI greyscale fallback and blur widths).
     #[arg(long, default_value_t = 109.0)]
     dpi: f32,
 
-    /// Device pixel ratio (1.0 = standard, 2.0 = HiDPI).
+    /// Device pixel ratio.
     #[arg(long, default_value_t = 1.0)]
     dpr: f32,
 
-    /// Skip the panel simulation (physical emitter placement + optical
-    /// blur). It is on by default; press S in the inspector to view it.
+    /// Skip the panel simulation (S, metrics and auto-tune are unavailable).
     #[arg(long, default_value_t = false)]
     no_simulate: bool,
 
-    /// Accepted for compatibility; the simulation is on by default.
+    /// Accepted for compatibility: simulation is on by default.
     #[arg(long, default_value_t = false, hide = true)]
     simulate: bool,
 
-    /// Open the inspector showing the simulated panel instead of the raw render.
+    /// Open in the simulated-panel view.
     #[arg(long, default_value_t = false)]
     start_simulated: bool,
 
-    /// Write the first frame of the inspector to a PPM image and exit.
+    /// Write the first frame to a PPM image and exit.
     #[arg(long, value_name = "FILE")]
     snapshot: Option<String>,
 
-    /// PSF sigma in pixel units for optical blur simulation.
-    /// Overrides --viewing-dist. 0 shows the bare emitters with no blur.
-    /// Without this flag sigma is derived from --viewing-dist and --dpi
-    /// (0.45 for a 109dpi panel at 50cm).
+    /// Optical blur sigma in logical pixels; 0 disables blur. Overrides
+    /// --viewing-dist and --psf-fwhm for the blur.
     #[arg(long)]
     psf_sigma: Option<f32>,
 
-    /// Viewing distance in mm for physically-derived PSF sigma.
-    /// Uses display DPI to convert to pixel units.
-    /// Ignored if --psf-sigma is set.
+    /// Eye-to-panel distance in millimetres.
     #[arg(long, default_value_t = 500.0)]
     viewing_dist: f32,
 
-    /// PSF width (FWHM) in arcminutes at the viewer's eye, used with
-    /// --viewing-dist to derive the PSF sigma. Ignored if --psf-sigma is set.
+    /// Angular width (FWHM) of the eye's point spread function, arcminutes.
     #[arg(long, default_value_t = DEFAULT_PSF_FWHM_ARCMIN)]
     psf_fwhm: f32,
 
-    /// Simulation oversampling: emission-map samples per pixel, per axis.
-    /// Higher resolves emitter shapes more finely and costs more time.
+    /// Frequency at which the eye's colour sensitivity has halved, in
+    /// cycles per degree. Sets what counts as visible fringing.
+    #[arg(long, default_value_t = csf::CHROMA_HALF_CPD)]
+    chroma_cutoff: f32,
+
+    /// Simulation samples per logical pixel per axis (1–16).
     #[arg(long, default_value_t = DEFAULT_OVERSAMPLE, value_parser = clap::value_parser!(u32).range(1..=16))]
     sim_scale: u32,
 }
 
-fn parse_layout(s: &str) -> SubpixelLayout {
-    match s.to_lowercase().as_str() {
-        "rgb"     => SubpixelLayout::RgbStripe,
-        "bgr"     => SubpixelLayout::BgrStripe,
-        "pentile" => SubpixelLayout::PentileRgbg,
-        "delta"   => SubpixelLayout::DeltaRgb,
-        "wrgb"    => SubpixelLayout::Wrgb,
-        "grey" | "gray" | "greyscale" | "grayscale" => SubpixelLayout::Greyscale,
-        other => {
-            eprintln!("Unknown layout '{other}', defaulting to pentile.");
-            SubpixelLayout::PentileRgbg
-        }
-    }
+fn fail(message: impl std::fmt::Display) -> ! {
+    eprintln!("{message}");
+    std::process::exit(1);
 }
 
 // ── Default font ──────────────────────────────────────────────────────────────
@@ -172,115 +184,114 @@ fn main() {
     profile.dpi = args.dpi;
     profile.device_pixel_ratio = args.dpr;
 
-    let layout = parse_layout(&args.layout);
-
-    let font = match args.font.clone().or_else(default_font) {
-        Some(path) => path,
-        None => {
-            eprintln!("No default font found on this system. Pass one with --font <path>.");
-            std::process::exit(1);
+    // ── Panel ──────────────────────────────────────────────────────────────────
+    let mut layout = SubpixelLayout::from_name(&args.layout).unwrap_or_else(|| {
+        eprintln!("Unknown layout '{}', defaulting to pentile.", args.layout);
+        SubpixelLayout::PentileRgbg
+    });
+    let mut geometry = PanelGeometry::for_layout(layout);
+    let mut bleed = BleedProfile::oled_default();
+    let mut panel_source = None;
+    if let Some(path) = &args.panel {
+        let panel = PanelDescription::load(path).unwrap_or_else(|e| fail(format!("Cannot load panel file: {e}")));
+        if let Some(l) = panel.layout {
+            layout = l;
         }
-    };
+        if let Some(b) = panel.bleed {
+            bleed = b;
+        }
+        geometry = panel.geometry;
+        panel_source = Some(panel.source.unwrap_or_else(|| path.clone()));
+    }
 
-    // ── Simulation params ──────────────────────────────────────────────────────
-    let sim_params = if let Some(sigma) = args.psf_sigma {
-        let mut p = SimulationParams::oled_default();
-        p.sigma = sigma.max(0.0);
-        p
-    } else {
-        SimulationParams::from_viewing_distance(&profile, args.viewing_dist, args.psf_fwhm)
-    };
-    let geometry = PanelGeometry::for_layout(layout);
+    let font = args
+        .font
+        .clone()
+        .or_else(default_font)
+        .unwrap_or_else(|| fail("No default font found on this system. Pass one with --font <path>."));
+
+    let simulate = !args.no_simulate;
+    let _ = args.simulate; // on by default; flag kept so old commands still run
 
     println!("KAGE — Kinetic Adaptive Glyph Engine");
     println!("  Font:       {}{}", font, if args.font.is_none() { "  (system default)" } else { "" });
     println!("  Glyph:      '{}'  (U+{:04X})", args.glyph, args.glyph as u32);
-    println!("  Size:       {}px", args.size);
-    println!("  Layout:     {:?}", layout);
+    println!("  Size:       {}px  ({}× supersampled coverage)", args.size, args.supersample);
+    println!("  Layout:     {}", layout.label());
+    println!("  Panel:      {}{}", geometry.name, panel_source.map(|s| format!("  [{s}]")).unwrap_or_default());
     println!("  DPI:        {} (DPR {}×)", profile.dpi, profile.device_pixel_ratio);
     println!("  HiDPI:      {}", profile.is_hidpi());
-    let simulate = !args.no_simulate;
-    let _ = args.simulate; // on by default; flag kept so old commands still run
-    if simulate {
-        println!("  Simulate:   ON  (sigma={:.3}px, {}× oversampling)", sim_params.sigma, args.sim_scale);
-        println!("  Panel:      {}", geometry.name);
-    } else {
-        println!("  Simulate:   OFF  (--no-simulate)");
-    }
+
+    // ── Font and pipeline ──────────────────────────────────────────────────────
+    let face = FontFace::load(&font, args.size).unwrap_or_else(|e| fail(format!("Error loading font '{font}': {e}")));
+    let config = PipelineConfig {
+        layout,
+        geometry,
+        bleed,
+        profile: profile.clone(),
+        simulate,
+        sim_scale: args.sim_scale,
+        psf_fwhm_arcmin: args.psf_fwhm,
+        psf_sigma: args.psf_sigma.map(|s| s.max(0.0)),
+        chroma_cutoff_cpd: args.chroma_cutoff,
+    };
+    let (mut pipeline, glyph) = match Pipeline::from_font(config, &face, args.glyph, args.supersample) {
+        Ok(Some(built)) => built,
+        Ok(None) => fail(format!("Glyph '{}' (U+{:04X}) not found in font.", args.glyph, args.glyph as u32)),
+        Err(e) => fail(format!("Cannot render on this panel: {e}")),
+    };
+    let (width, height) = (pipeline.coverage().width(), pipeline.coverage().height());
     println!();
-
-    // ── Font loading ───────────────────────────────────────────────────────────
-    let face = match FontFace::load(&font, args.size) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("Error loading font '{font}': {e}");
-            std::process::exit(1);
-        }
-    };
-
-    // ── Rasterize glyph ────────────────────────────────────────────────────────
-    let bitmap = match face.rasterize_grey(args.glyph) {
-        Some(b) => b,
-        None => {
-            eprintln!(
-                "Glyph '{}' (U+{:04X}) not found in font.",
-                args.glyph, args.glyph as u32
-            );
-            std::process::exit(1);
-        }
-    };
-
     println!(
-        "Glyph bitmap: {}×{} pixels  bearing=({},{})  advance={}px",
-        bitmap.width, bitmap.height, bitmap.bearing_x, bitmap.bearing_y, bitmap.advance
+        "Glyph bitmap: {width}×{height} pixels  bearing=({},{})  advance={}px",
+        glyph.bearing_x, glyph.bearing_y, glyph.advance
     );
 
-    let glyph_buf = bitmap.into_glyph_buffer();
+    // ── Settings ───────────────────────────────────────────────────────────────
+    let mut render = RenderParams::for_layout(layout);
+    if let Some(v) = args.luma_footprint {
+        render.luma_footprint = v;
+    }
+    if let Some(v) = args.chroma_footprint {
+        render.chroma_footprint = v;
+    }
+    if let Some(v) = args.edge_suppression {
+        render.edge_suppression = v;
+    }
+    if args.no_fringe {
+        render.edge_suppression = 0.0;
+    }
+    let mut tuning = Tuning { render: render.clamped(), viewing_distance_mm: args.viewing_dist };
+    if args.auto_tune {
+        match pipeline.auto_tune(&tuning) {
+            Some(best) => tuning.render = best,
+            None => eprintln!("--auto-tune needs the simulation; ignoring it because of --no-simulate."),
+        }
+    }
+    println!(
+        "OLED-aware:   luma footprint {:.2} px, chroma footprint {:.2} px, edge suppression {:.2}{}",
+        tuning.render.luma_footprint,
+        tuning.render.chroma_footprint,
+        tuning.render.edge_suppression,
+        if args.auto_tune && simulate { "  (auto-tuned)" } else { "" }
+    );
 
-    // ── Render (linear light) ──────────────────────────────────────────────────
-    let grey_raw  = render(&glyph_buf, RenderMode::Greyscale,  layout, &profile);
-    let sp_raw    = render(&glyph_buf, RenderMode::SubpixelAa, layout, &profile);
-    // The OLED-aware path is the layout filter plus fringe suppression, so
-    // with suppression disabled it is the plain subpixel renderer.
-    let oled_mode = if args.no_fringe { RenderMode::SubpixelAa } else { RenderMode::OledAware };
-    let oled_raw  = render(&glyph_buf, oled_mode, layout, &profile);
-
-    println!("Rendered three grids ({}×{}):", grey_raw.width, grey_raw.height);
-    println!("  Greyscale AA, Subpixel AA, OLED-Aware");
-
-    // ── Simulate (linear light — emitter placement + PSF convolution) ──────────
-    let mut metrics: Option<[PanelMetrics; 3]> = None;
-    let simulated = simulate.then(|| {
-        let run = |grid: &SubpixelGrid| simulate_panel(grid, &geometry, &sim_params, args.sim_scale);
-        let set = ViewSet {
-            grey: run(&grey_raw),
-            subpixel: run(&sp_raw),
-            oled: run(&oled_raw),
-            scale: args.sim_scale,
-        };
-
-        // Luminance error: the simulated image, integrated back to one value
-        // per pixel, against the intended coverage. Chroma: colour residue in
-        // what the viewer sees — fringing, for white-on-black text.
+    // ── Render, simulate, score ────────────────────────────────────────────────
+    let output = pipeline.run(&tuning);
+    if let (Some(set), Some(metrics)) = (&output.simulated, &output.metrics) {
         println!();
-        println!("Simulated panel ({}×{} samples):", set.grey.width, set.grey.height);
-        println!("  {:<13} {:>14} {:>14}", "", "luminance err", "chroma residue");
-        let measure = |label: &str, grid: &SubpixelGrid| {
-            let per_pixel = integrate_pixels(grid, args.sim_scale);
-            let m = PanelMetrics {
-                luminance_error: luminance_rms_error(&grey_raw, &per_pixel).unwrap_or(f32::NAN),
-                chroma: chroma_rms(grid),
-            };
-            println!("  {:<13} {:>14.4} {:>14.4}", label, m.luminance_error, m.chroma);
-            m
-        };
-        metrics = Some([
-            measure("Greyscale AA", &set.grey),
-            measure("Subpixel AA", &set.subpixel),
-            measure("OLED-Aware", &set.oled),
-        ]);
-        set
-    });
+        println!(
+            "Simulated panel ({}×{} samples, blur sigma {:.3} px, viewed from {:.0} mm):",
+            set.grey.width, set.grey.height, output.sigma, tuning.viewing_distance_mm
+        );
+        println!("  {:<13} {:>14} {:>15} {:>15}", "", "luminance err", "visible chroma", "chroma residue");
+        for (label, m) in ["Greyscale AA", "Subpixel AA", "OLED-Aware"].iter().zip(metrics) {
+            println!("  {:<13} {:>14.4} {:>15.4} {:>15.4}", label, m.luminance_error, m.visible_chroma, m.chroma);
+        }
+    } else {
+        println!();
+        println!("Simulation off (--no-simulate).");
+    }
 
     println!();
     println!("Controls:");
@@ -295,59 +306,38 @@ fn main() {
     println!("  Esc         quit");
 
     // ── Inspector window ───────────────────────────────────────────────────────
-    let raw = ViewSet {
-        grey: grey_raw,
-        subpixel: sp_raw,
-        oled: oled_raw,
-        scale: 1,
-    };
     let font_name = std::path::Path::new(&font)
         .file_stem()
         // Variable fonts are often named like "NotoSans[wght]"; drop the axis list.
         .map(|stem| stem.to_string_lossy().split('[').next().unwrap_or_default().to_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| font.clone());
-    let simulation_note = simulated.as_ref().map(|_| {
-        if sim_params.sigma > 0.0 {
-            format!(
-                "Blurred as the eye would see it (sigma {:.2} px). Zoom in to see the emitters.",
-                sim_params.sigma
-            )
-        } else {
-            "No optical blur: these are the bare emitters.".to_owned()
-        }
-    });
+
     let config = InspectorConfig {
         window_title: format!("KAGE — '{}' @ {}px — {}", args.glyph, args.size, layout.label()),
         subject: format!("Glyph '{}'  ·  {}  ·  {} px", args.glyph, font_name, args.size),
         layout_name: layout.label().to_owned(),
-        simulation_note,
-        metrics,
+        simulation_note: output.simulated.as_ref().map(|_| simulation_note(output.sigma)),
+        metrics: output.metrics,
         // Interface text always uses a system font, whatever --font is: the
         // font under test may not have Latin letters at all.
         ui_font: default_font().or_else(|| Some(font.clone())),
     };
-    let mut inspector = match Inspector::new(config, raw, simulated, profile) {
-        Ok(i) => i,
-        Err(e) => {
-            eprintln!("Failed to open inspector window: {e}");
-            std::process::exit(1);
-        }
-    };
+
+    let mut inspector = Inspector::new(config, output.raw, output.simulated, profile)
+        .unwrap_or_else(|e| fail(format!("Failed to open inspector window: {e}")));
     if args.start_simulated {
         inspector.set_simulated(true);
     }
 
     if let Some(path) = &args.snapshot {
-        let result = inspector.update().map_err(|e| e.to_string()).and_then(|()| {
-            inspector.save_ppm(path).map_err(|e| e.to_string())
-        });
+        let result = inspector
+            .update()
+            .map_err(|e| e.to_string())
+            .and_then(|()| inspector.save_ppm(path).map_err(|e| e.to_string()));
         match result {
             Ok(()) => println!("Wrote snapshot to {path}"),
-            Err(e) => {
-                eprintln!("Snapshot failed: {e}");
-                std::process::exit(1);
-            }
+            Err(e) => fail(format!("Snapshot failed: {e}")),
         }
         return;
     }
@@ -358,5 +348,14 @@ fn main() {
             eprintln!("Inspector error: {e}");
             break;
         }
+    }
+}
+
+/// One sentence about the optical blur, for the inspector's header.
+fn simulation_note(sigma: f32) -> String {
+    if sigma > 0.0 {
+        format!("Blurred as the eye would see it (sigma {sigma:.2} px). Zoom in to see the emitters.")
+    } else {
+        "No optical blur: these are the bare emitters.".to_owned()
     }
 }

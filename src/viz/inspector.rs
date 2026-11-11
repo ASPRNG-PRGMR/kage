@@ -92,12 +92,12 @@ const PANELS: [(&str, u32, &str); 3] = [
     (
         "Subpixel AA",
         0xFF_E8_7B_3A,
-        "ClearType-style. Each colour channel is filtered separately: sharper, but edges pick up colour.",
+        "ClearType-style. A fixed kernel filters each colour channel of the pixel grid: edges pick up colour.",
     ),
     (
         "OLED-Aware",
         0xFF_5A_C9_5A,
-        "KAGE's approach. The filter follows the panel's real subpixel layout and tones down fringes at hard edges.",
+        "KAGE's approach. Each colour is sampled from the glyph at the spot where its emitter sits on this panel.",
     ),
 ];
 
@@ -239,10 +239,12 @@ fn scale_grid(mut grid: SubpixelGrid, factor: f32) -> SubpixelGrid {
 /// heading while the simulated view is active.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PanelMetrics {
-    /// RMS luminance difference from the intended coverage.
+    /// RMS luminance difference from what an ideal display would show.
     pub luminance_error: f32,
-    /// RMS colour residue in the simulated image (fringing).
+    /// RMS of all colour in the simulated image, visible or not.
     pub chroma: f32,
+    /// RMS colour left after the eye's chromatic low-pass: fringing.
+    pub visible_chroma: f32,
 }
 
 /// What the inspector should say about what it is showing.
@@ -994,7 +996,7 @@ impl Inspector {
                 let small = ui.px(SIZE_SMALL);
                 let label = format!(
                     "Luminance error {:.3}    Colour fringing {:.3}",
-                    m.luminance_error, m.chroma
+                    m.luminance_error, m.visible_chroma
                 );
                 let x = right - self.text_width(small, &label);
                 if x > name_end + ui.len(16) {
